@@ -42,6 +42,7 @@ class FrameSelectionWidget(QWidget):
     """Widget for selecting which frame to use for calibration from multiple samples."""
 
     frame_selected = Signal(int)  # Emits the selected frame index
+    frames_accumulated = Signal(int)  # Emits the image frame index to use alongside merged cloud
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,6 +83,15 @@ class FrameSelectionWidget(QWidget):
         self.back_button = QPushButton("← Back to Transform Selection")
         self.back_button.clicked.connect(self.go_back)
         bottom_layout.addWidget(self.back_button)
+
+        # Accumulate button
+        self.accumulate_button = QPushButton("Accumulate All Frames")
+        self.accumulate_button.setStyleSheet("padding: 10px; background-color: #2a5ca8;")
+        self.accumulate_button.setToolTip(
+            "Merge all LiDAR frames into one dense point cloud and use the selected image frame"
+        )
+        self.accumulate_button.clicked.connect(self.accumulate_all_frames)
+        bottom_layout.addWidget(self.accumulate_button)
 
         bottom_layout.addStretch()
 
@@ -250,6 +260,11 @@ class FrameSelectionWidget(QWidget):
     def go_back(self):
         """Go back to transform selection."""
         self.parent().setCurrentIndex(1)  # Transform view
+
+    def accumulate_all_frames(self):
+        """Emit signal to merge all LiDAR frames, using the selected image frame."""
+        if self.frame_samples and self.image_topic:
+            self.frames_accumulated.emit(self.selected_frame_index)
 
     def proceed_to_calibration(self):
         """Proceed to calibration with selected frame."""

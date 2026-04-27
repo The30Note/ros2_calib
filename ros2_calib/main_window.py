@@ -337,6 +337,7 @@ class MainWindow(QMainWindow):
     def setup_frame_selection_view(self):
         self.frame_selection_widget = FrameSelectionWidget(self)
         self.frame_selection_widget.frame_selected.connect(self.on_frame_selected)
+        self.frame_selection_widget.frames_accumulated.connect(self.on_frames_accumulated)
         self.stacked_widget.addWidget(self.frame_selection_widget)
 
     def setup_results_view(self):
@@ -824,6 +825,56 @@ class MainWindow(QMainWindow):
                 image_topic: self.frame_samples[image_topic][frame_index]["data"],
                 pointcloud_topic: self.frame_samples[pointcloud_topic][frame_index]["data"],
                 camerainfo_topic: self.frame_samples[camerainfo_topic][frame_index]["data"],
+            },
+            "tf_messages": self.tf_messages,
+        }
+        self.tf_title_label.setText(
+            f"Select Initial Transformation: {self.lidar_frame} → {self.camera_frame}"
+        )
+        self.load_tf_topics_in_transform_view()
+        self.stacked_widget.setCurrentIndex(2)
+
+    def on_frames_accumulated(self, image_frame_index: int):
+        """Merge all LiDAR frames into one dense cloud and proceed with the selected image frame."""
+        print(f"[DEBUG] Accumulating all LiDAR frames, using image frame {image_frame_index + 1}.")
+        image_topic = self.selected_topics_data["image_topic"]
+        pointcloud_topic = self.selected_topics_data["pointcloud_topic"]
+        camerainfo_topic = self.selected_topics_data["camerainfo_topic"]
+
+        pc_frames = self.frame_samples[pointcloud_topic]
+        first_raw = pc_frames[0]["data"]
+
+        merged_data = b"".join(bytes(f["data"].data) for f in pc_frames)
+        merged_width = sum(f["data"].width * f["data"].height for f in pc_frames)
+
+        merged_pc = ros_utils.PointCloud2(
+            header=first_raw.header,
+            height=1,
+            width=merged_width,
+            fields=[
+                ros_utils.PointField(
+                    name=f.name, offset=f.offset, datatype=f.datatype, count=f.count
+                )
+                for f in first_raw.fields
+            ],
+            is_bigendian=first_raw.is_bigendian,
+            point_step=first_raw.point_step,
+            row_step=first_raw.point_step * merged_width,
+            data=merged_data,
+            is_dense=first_raw.is_dense,
+        )
+
+        print(f"[DEBUG] Merged {len(pc_frames)} frames → {merged_width} points total.")
+
+        self.selected_topics = {
+            "image_topic": image_topic,
+            "pointcloud_topic": pointcloud_topic,
+            "camerainfo_topic": camerainfo_topic,
+            "topic_types": self.topic_types,
+            "raw_messages": {
+                image_topic: self.frame_samples[image_topic][image_frame_index]["data"],
+                pointcloud_topic: merged_pc,
+                camerainfo_topic: self.frame_samples[camerainfo_topic][image_frame_index]["data"],
             },
             "tf_messages": self.tf_messages,
         }

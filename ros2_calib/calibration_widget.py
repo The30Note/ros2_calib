@@ -63,11 +63,43 @@ from .lidar_cleaner import LiDARCleaner
 class PointCloudItem(QGraphicsItem):
     """A QGraphicsItem that efficiently draws a large number of points."""
 
-    def __init__(self, points, colors, point_size):
+    def __init__(self, points, colors, point_size, opacity=0.8):
         super().__init__()
         self.points = points
         self.point_size = point_size
-        self.qcolors = [QColor.fromRgbF(r, g, b, a) for r, g, b, a in colors]
+        self.opacity = opacity
+        # Pre-convert colors to uint8 RGBA once at construction time
+        colors_arr = np.array(colors)  # (N, 4) float 0-1
+        self._colors_u8 = (colors_arr * 255).clip(0, 255).astype(np.uint8)
+        self._pixmap = None
+        self._pixmap_origin = None
+        self._build_pixmap()
+
+    def _build_pixmap(self):
+        if self.points.shape[0] == 0:
+            return
+        r = max(1, int(self.point_size / 2))
+        xs = self.points[:, 0].astype(np.int32)
+        ys = self.points[:, 1].astype(np.int32)
+        x0, y0 = int(xs.min()) - r, int(ys.min()) - r
+        w = int(xs.max()) - x0 + r + 1
+        h = int(ys.max()) - y0 + r + 1
+
+        img = np.zeros((h, w, 4), dtype=np.uint8)
+        lxs = np.clip(xs - x0, 0, w - 1)
+        lys = np.clip(ys - y0, 0, h - 1)
+
+        # Paint all points as single pixels — fully vectorized, O(N) numpy
+        img[lys, lxs] = self._colors_u8
+
+        # Expand to point_size via dilation (OpenCV, far faster than a Python loop)
+        if r > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (r * 2 + 1, r * 2 + 1))
+            img = cv2.dilate(img, kernel)
+
+        qimg = QImage(img.tobytes(), w, h, 4 * w, QImage.Format_RGBA8888)
+        self._pixmap = QPixmap.fromImage(qimg)
+        self._pixmap_origin = (x0, y0)
 
     def boundingRect(self):
         if self.points.shape[0] == 0:
@@ -83,12 +115,10 @@ class PointCloudItem(QGraphicsItem):
         )
 
     def paint(self, painter: QPainter, option, widget=None):
-        painter.setPen(Qt.NoPen)
-        radius = self.point_size / 2.0
-        for i in range(self.points.shape[0]):
-            painter.setBrush(self.qcolors[i])
-            x, y = self.points[i, 0], self.points[i, 1]
-            painter.drawEllipse(QRectF(x - radius, y - radius, self.point_size, self.point_size))
+        if self._pixmap is not None:
+            painter.setOpacity(self.opacity)
+            painter.drawPixmap(int(self._pixmap_origin[0]), int(self._pixmap_origin[1]), self._pixmap)
+            painter.setOpacity(1.0)
 
 
 class ZoomableView(QGraphicsView):
@@ -148,6 +178,9 @@ class CalibrationWidget(QWidget):
         # Image rectification state
         self.original_cv_image = None
         self.is_rectification_enabled = False
+        self._is_fisheye = getattr(self.camerainfo_msg, "distortion_model", "").lower() in (
+            "fisheye", "kannala_brandt", "equidistant"
+        )
 
         self.selection_mode = None
         self.selected_2d_point = None
@@ -170,6 +203,7 @@ class CalibrationWidget(QWidget):
 
         left_layout = QVBoxLayout()
         self.scene = QGraphicsScene()
+        self._bg_pixmap_item = None
         self.view = ZoomableView(self.scene)
         self.view.viewport().installEventFilter(self)
         left_layout.addWidget(self.view)
@@ -204,8 +238,56 @@ class CalibrationWidget(QWidget):
         threshold = 1e-6
         return bool(np.any(np.abs(dist_coeffs) > threshold))
 
+    def _remap_correspondences(self, to_rectified: bool):
+        """Transform stored 2D correspondence keys between distorted and undistorted pixel space."""
+        if not self.correspondences:
+            return
+        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+        D = np.array(self.camerainfo_msg.d)
+
+        pts = np.array([[u, v] for u, v in self.correspondences.keys()],
+                       dtype=np.float32).reshape(-1, 1, 2)
+
+        if to_rectified:
+            # Distorted pixels → undistorted pixels
+            if self._is_fisheye:
+                remapped = cv2.fisheye.undistortPoints(pts, K, D[:4].reshape(4, 1), P=K)
+            else:
+                remapped = cv2.undistortPoints(pts, K, D, P=K)
+        else:
+            # Undistorted pixels → distorted pixels via forward distortion formula
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+            xn = (pts[:, 0, 0] - cx) / fx
+            yn = (pts[:, 0, 1] - cy) / fy
+            if self._is_fisheye:
+                k1, k2, k3, k4 = D[:4]
+                r = np.sqrt(xn ** 2 + yn ** 2)
+                theta = np.arctan(r)
+                t2 = theta ** 2
+                theta_d = theta * (1 + k1 * t2 + k2 * t2 ** 2 + k3 * t2 ** 3 + k4 * t2 ** 4)
+                scale = np.where(r < 1e-8, 1.0, theta_d / r)
+                xd, yd = scale * xn, scale * yn
+            else:
+                k1, k2 = D[0], D[1]
+                p1, p2 = D[2], D[3]
+                k3 = D[4] if len(D) > 4 else 0.0
+                r2 = xn ** 2 + yn ** 2
+                radial = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+                xd = xn * radial + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn ** 2)
+                yd = yn * radial + p1 * (r2 + 2 * yn ** 2) + 2 * p2 * xn * yn
+            remapped = np.stack([fx * xd + cx, fy * yd + cy], axis=-1).reshape(-1, 1, 2)
+
+        old_keys = list(self.correspondences.keys())
+        new_corr = {}
+        for old_key, new_pt in zip(old_keys, remapped):
+            new_key = (float(new_pt[0, 0]), float(new_pt[0, 1]))
+            new_corr[new_key] = self.correspondences[old_key]
+        self.correspondences = new_corr
+        self.update_corr_list()
+
     def toggle_rectification(self, enabled):
         """Toggle image rectification on/off."""
+        self._remap_correspondences(to_rectified=enabled)
         self.is_rectification_enabled = enabled
         self.display_image()  # Refresh the display
 
@@ -222,7 +304,10 @@ class CalibrationWidget(QWidget):
         try:
             # Use cv2.undistort with the same camera matrix as newCameraMatrix
             # This preserves the same image dimensions and focal length
-            rectified_image = cv2.undistort(image, K, dist_coeffs, None, K)
+            if self._is_fisheye:
+                rectified_image = cv2.fisheye.undistortImage(image, K, dist_coeffs[:4].reshape(4, 1), None, K)
+            else:
+                rectified_image = cv2.undistort(image, K, dist_coeffs, None, K)
             return rectified_image
         except Exception as e:
             print(f"[WARNING] Failed to rectify image: {e}")
@@ -241,6 +326,11 @@ class CalibrationWidget(QWidget):
         self.point_size_spinbox.setRange(1, 10)
         self.point_size_spinbox.setValue(AppConstants.DEFAULT_POINT_SIZE)
         view_controls_layout.addRow("Point Size:", self.point_size_spinbox)
+        self.opacity_spinbox = QDoubleSpinBox()
+        self.opacity_spinbox.setRange(0.0, 1.0)
+        self.opacity_spinbox.setSingleStep(0.05)
+        self.opacity_spinbox.setValue(0.8)
+        view_controls_layout.addRow("Point Opacity:", self.opacity_spinbox)
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(
             [
@@ -439,6 +529,7 @@ class CalibrationWidget(QWidget):
 
         self.default_button_style = UIStyles.DEFAULT_BUTTON
         self.point_size_spinbox.valueChanged.connect(self._on_view_params_changed)
+        self.opacity_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.colormap_combo.currentTextChanged.connect(self._on_view_params_changed)
         self.colorization_mode_combo.currentTextChanged.connect(self._on_colorization_mode_changed)
         self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
@@ -825,20 +916,28 @@ class CalibrationWidget(QWidget):
         h, w, c = self.cv_image.shape
         self.image_res_label.setText(f"{w} x {h}")
 
-        # Clear existing image from scene but preserve other items (except PointCloudItem)
-        items_to_preserve = []
-        for item in self.scene.items():
-            if not isinstance(item, QGraphicsPixmapItem) and not isinstance(item, PointCloudItem):
-                items_to_preserve.append(item)
-
-        # Clear the scene and add the new image
-        self.scene.clear()
+        # Update the background image in-place to avoid deleting other scene items
         q_image = QImage(self.cv_image.data, w, h, 3 * w, QImage.Format_RGB888)
-        self.scene.addPixmap(QPixmap.fromImage(q_image))
+        new_pixmap = QPixmap.fromImage(q_image)
+        if self._bg_pixmap_item is None:
+            self._bg_pixmap_item = self.scene.addPixmap(new_pixmap)
+            self._bg_pixmap_item.setZValue(-1)
+        else:
+            self._bg_pixmap_item.setPixmap(new_pixmap)
 
-        # Restore preserved items (PointCloudItem will be recreated by project_pointcloud)
-        for item in items_to_preserve:
-            self.scene.addItem(item)
+        # Remove stale point cloud items — they will be recreated by project_pointcloud
+        if self.point_cloud_item is not None:
+            try:
+                self.scene.removeItem(self.point_cloud_item)
+            except RuntimeError:
+                pass
+            self.point_cloud_item = None
+        if self.second_point_cloud_item is not None:
+            try:
+                self.scene.removeItem(self.second_point_cloud_item)
+            except RuntimeError:
+                pass
+            self.second_point_cloud_item = None
 
         # Re-project point cloud with the updated image
         self.project_pointcloud()
@@ -908,7 +1007,8 @@ class CalibrationWidget(QWidget):
             )
             cloud_arr = cloud_arr[valid_mask]
             self.points_xyz = np.vstack([cloud_arr["x"], cloud_arr["y"], cloud_arr["z"]]).T
-            self.intensities = cloud_arr["intensity"]
+            intensity_field = "intensity" if "intensity" in cloud_arr.dtype.names else "reflectivity"
+            self.intensities = cloud_arr[intensity_field].astype(np.float32)
             if self.intensities.size > 0:
                 # Set initial min/max values based on current colorization mode
                 self._update_min_max_values_for_mode()
@@ -921,8 +1021,13 @@ class CalibrationWidget(QWidget):
         tvec = self.extrinsics[:3, 3]
         # When rectification is disabled, apply distortion to projected points
         # so they align with the raw (distorted) image
-        dist_coeffs = None if self.is_rectification_enabled else np.array(self.camerainfo_msg.d)
-        points_proj_cv, _ = cv2.projectPoints(self.points_xyz, rvec, tvec, K, dist_coeffs)
+        d_raw = np.array(self.camerainfo_msg.d)
+        if self._is_fisheye:
+            dist_coeffs = None if self.is_rectification_enabled else d_raw[:4].reshape(4, 1)
+            points_proj_cv, _ = cv2.fisheye.projectPoints(self.points_xyz.reshape(-1, 1, 3), rvec, tvec, K, dist_coeffs if dist_coeffs is not None else np.zeros((4, 1)))
+        else:
+            dist_coeffs = None if self.is_rectification_enabled else d_raw
+            points_proj_cv, _ = cv2.projectPoints(self.points_xyz, rvec, tvec, K, dist_coeffs)
         points_proj_cv = points_proj_cv.reshape(-1, 2)
         points_cam = (self.extrinsics[:3, :3] @ self.points_xyz.T).T + tvec
         z_cam = points_cam[:, 2]
@@ -966,7 +1071,8 @@ class CalibrationWidget(QWidget):
         colors = cmap(norm_values)
         colors[:, 3] = 0.8
         self.point_cloud_item = PointCloudItem(
-            self.points_proj_valid, colors, self.point_size_spinbox.value()
+            self.points_proj_valid, colors, self.point_size_spinbox.value(),
+            opacity=self.opacity_spinbox.value()
         )
         self.scene.addItem(self.point_cloud_item)
 
@@ -1007,8 +1113,13 @@ class CalibrationWidget(QWidget):
         tvec = self.extrinsics[:3, 3]
         # When rectification is disabled, apply distortion to projected points
         # so they align with the raw (distorted) image
-        dist_coeffs = None if self.is_rectification_enabled else np.array(self.camerainfo_msg.d)
-        points_proj_cv, _ = cv2.projectPoints(transformed_points, rvec, tvec, K, dist_coeffs)
+        d_raw = np.array(self.camerainfo_msg.d)
+        if self._is_fisheye:
+            dist_coeffs = None if self.is_rectification_enabled else d_raw[:4].reshape(4, 1)
+            points_proj_cv, _ = cv2.fisheye.projectPoints(transformed_points.reshape(-1, 1, 3), rvec, tvec, K, dist_coeffs if dist_coeffs is not None else np.zeros((4, 1)))
+        else:
+            dist_coeffs = None if self.is_rectification_enabled else d_raw
+            points_proj_cv, _ = cv2.projectPoints(transformed_points, rvec, tvec, K, dist_coeffs)
         points_proj_cv = points_proj_cv.reshape(-1, 2)
 
         # Transform to camera coordinates to check visibility
