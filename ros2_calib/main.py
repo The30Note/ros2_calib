@@ -20,8 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import signal
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
@@ -29,6 +31,14 @@ from .main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    # Qt blocks the Python signal handler while the event loop is running;
+    # a short timer lets Python check for signals periodically.
+    timer = QTimer()
+    timer.start(200)
+    timer.timeout.connect(lambda: None)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

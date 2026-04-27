@@ -75,26 +75,36 @@ class PointCloudItem(QGraphicsItem):
         self._pixmap_origin = None
         self._build_pixmap()
 
+    def update_data(self, points, colors, point_size, opacity):
+        """Update projected points and visual params in-place, avoiding remove/add."""
+        self.prepareGeometryChange()
+        self.points = points
+        self.point_size = point_size
+        self.opacity = opacity
+        self._colors_u8 = (np.array(colors) * 255).clip(0, 255).astype(np.uint8)
+        self._build_pixmap()
+        self.update()
+
     def _build_pixmap(self):
         if self.points.shape[0] == 0:
+            self._pixmap = None
             return
-        r = max(1, int(self.point_size / 2))
+        s = max(1, int(self.point_size))
+        pad = s // 2
         xs = self.points[:, 0].astype(np.int32)
         ys = self.points[:, 1].astype(np.int32)
-        x0, y0 = int(xs.min()) - r, int(ys.min()) - r
-        w = int(xs.max()) - x0 + r + 1
-        h = int(ys.max()) - y0 + r + 1
+        x0, y0 = int(xs.min()) - pad, int(ys.min()) - pad
+        w = int(xs.max()) - x0 + pad + 1
+        h = int(ys.max()) - y0 + pad + 1
 
         img = np.zeros((h, w, 4), dtype=np.uint8)
         lxs = np.clip(xs - x0, 0, w - 1)
         lys = np.clip(ys - y0, 0, h - 1)
 
-        # Paint all points as single pixels — fully vectorized, O(N) numpy
         img[lys, lxs] = self._colors_u8
 
-        # Expand to point_size via dilation (OpenCV, far faster than a Python loop)
-        if r > 1:
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (r * 2 + 1, r * 2 + 1))
+        if s > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (s, s))
             img = cv2.dilate(img, kernel)
 
         qimg = QImage(img.tobytes(), w, h, 4 * w, QImage.Format_RGBA8888)
@@ -106,7 +116,7 @@ class PointCloudItem(QGraphicsItem):
             return QRectF()
         min_coords = np.min(self.points, axis=0)
         max_coords = np.max(self.points, axis=0)
-        pad = self.point_size / 2
+        pad = self.point_size // 2
         return QRectF(
             min_coords[0] - pad,
             min_coords[1] - pad,
@@ -349,7 +359,7 @@ class CalibrationWidget(QWidget):
         self.colormap_combo.setCurrentText(AppConstants.DEFAULT_COLORMAP)
         view_controls_layout.addRow("Colormap:", self.colormap_combo)
         self.colorization_mode_combo = QComboBox()
-        self.colorization_mode_combo.addItems(["Intensity", "Distance"])
+        self.colorization_mode_combo.addItems(["Intensity", "Distance", "LiDAR Edge", "Surface Normals"])
         self.colorization_mode_combo.setCurrentText("Intensity")
         view_controls_layout.addRow("Color Mode:", self.colorization_mode_combo)
         self.min_value_spinbox = QDoubleSpinBox()
@@ -360,6 +370,25 @@ class CalibrationWidget(QWidget):
         self.max_value_spinbox.setRange(-1e9, 1e9)
         self.max_value_spinbox.setDecimals(2)
         view_controls_layout.addRow("Max Value:", self.max_value_spinbox)
+
+        # Normal colour-frame rotation (only visible in Surface Normals mode)
+        self._normal_rot_labels = []
+        self._normal_rot_spinboxes = []
+        for label in ("Roll (°):", "Pitch (°):", "Yaw (°):"):
+            sb = QDoubleSpinBox()
+            sb.setRange(-180.0, 180.0)
+            sb.setSingleStep(1.0)
+            sb.setDecimals(1)
+            sb.setValue(0.0)
+            lbl = view_controls_layout.labelForField  # placeholder — set below
+            view_controls_layout.addRow(label, sb)
+            # Store the label widget so we can show/hide the row
+            lbl_widget = view_controls_layout.itemAt(
+                view_controls_layout.rowCount() - 1, QFormLayout.LabelRole
+            ).widget()
+            self._normal_rot_labels.append(lbl_widget)
+            self._normal_rot_spinboxes.append(sb)
+        self._set_normal_rotation_visible(False)
 
         # Image rectification checkbox
         self.rectify_checkbox = QCheckBox("Rectify Image")
@@ -374,9 +403,6 @@ class CalibrationWidget(QWidget):
         self.rectify_checkbox.toggled.connect(self.toggle_rectification)
         view_controls_layout.addRow(self.rectify_checkbox)
 
-        self.apply_view_button = QPushButton("Apply View Changes")
-        self.apply_view_button.clicked.connect(self.redraw_points)
-        view_controls_layout.addRow(self.apply_view_button)
 
         # Add Clean Occluded Points button here
         self.clean_occlusion_button = QPushButton("Clean Occluded Points")
@@ -532,6 +558,8 @@ class CalibrationWidget(QWidget):
         self.opacity_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.colormap_combo.currentTextChanged.connect(self._on_view_params_changed)
         self.colorization_mode_combo.currentTextChanged.connect(self._on_colorization_mode_changed)
+        for sb in self._normal_rot_spinboxes:
+            sb.valueChanged.connect(self._on_view_params_changed)
         self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.max_value_spinbox.valueChanged.connect(self._on_view_params_changed)
         return right_layout
@@ -575,13 +603,20 @@ class CalibrationWidget(QWidget):
         self.progress_bar.setVisible(False)
         self.redraw_points()
 
+    def _set_normal_rotation_visible(self, visible: bool):
+        for lbl, sb in zip(self._normal_rot_labels, self._normal_rot_spinboxes):
+            lbl.setVisible(visible)
+            sb.setVisible(visible)
+
     def _on_view_params_changed(self):
-        self.apply_view_button.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
+        self.redraw_points()
 
     def _on_colorization_mode_changed(self):
-        """Update min/max values when colorization mode changes."""
+        self._set_normal_rotation_visible(
+            self.colorization_mode_combo.currentText() == "Surface Normals"
+        )
         self._update_min_max_values_for_mode()
-        self._on_view_params_changed()
+        self.redraw_points()
 
     def _update_min_max_values_for_mode(self):
         """Update min/max spinbox values based on current colorization mode."""
@@ -590,7 +625,6 @@ class CalibrationWidget(QWidget):
 
         colorization_mode = self.colorization_mode_combo.currentText()
         if colorization_mode == "Distance":
-            # Calculate distances for all valid points
             if hasattr(self, "valid_indices") and len(self.valid_indices) > 0:
                 tvec = self.extrinsics[:3, 3]
                 points_cam = (self.extrinsics[:3, :3] @ self.points_xyz.T).T + tvec
@@ -599,12 +633,58 @@ class CalibrationWidget(QWidget):
                 min_dist, max_dist = np.quantile(distances, [0.01, 0.99])
                 self.min_value_spinbox.setValue(min_dist)
                 self.max_value_spinbox.setValue(max_dist)
+        elif colorization_mode == "LiDAR Edge":
+            if hasattr(self, "valid_indices") and len(self.valid_indices) > 0 and hasattr(self, "points_proj_valid"):
+                tvec = self.extrinsics[:3, 3]
+                pts_cam = (self.extrinsics[:3, :3] @ self.points_xyz[self.valid_indices].T).T + tvec
+                scores = self._compute_lidar_edge_scores(pts_cam, self.points_proj_valid)
+                self.min_value_spinbox.setValue(0.0)
+                self.max_value_spinbox.setValue(float(np.quantile(scores, 0.95)))
+        elif colorization_mode == "Surface Normals":
+            # No scalar range needed — RGB mapped directly from normal vector
+            self.min_value_spinbox.setEnabled(False)
+            self.max_value_spinbox.setEnabled(False)
+            return
         else:
-            # Intensity mode - use intensity values
             if hasattr(self, "intensities") and self.intensities.size > 0:
                 min_i, max_i = np.quantile(self.intensities, [0.01, 0.90])
                 self.min_value_spinbox.setValue(min_i)
                 self.max_value_spinbox.setValue(max_i)
+        self.min_value_spinbox.setEnabled(True)
+        self.max_value_spinbox.setEnabled(True)
+
+    def _compute_lidar_edge_scores(
+        self, pts_cam: np.ndarray, pts_2d: np.ndarray, k: int = 10
+    ) -> np.ndarray:
+        """Depth gradient in projected 2D space.
+        For each point, max(|depth_i - depth_j| / pixel_dist) over k 2D neighbours.
+        Spikes at depth discontinuities (box edges against a farther floor).
+        """
+        n = len(pts_2d)
+        if n < 2:
+            return np.zeros(n)
+        k = min(k, n - 1)
+        depths = pts_cam[:, 2]
+        tree = KDTree(pts_2d)
+        dists_2d, idx = tree.query(pts_2d, k=k + 1)        # (N, k+1)
+        neighbor_depths = depths[idx[:, 1:]]                # (N, k)
+        depth_diffs = np.abs(depths[:, None] - neighbor_depths)
+        pixel_dists = np.maximum(dists_2d[:, 1:], 1.0)     # clamp to ≥1 px
+        return (depth_diffs / pixel_dists).max(axis=1)
+
+    def _compute_normals(self, pts_3d: np.ndarray, k: int = 15) -> np.ndarray:
+        """Estimate surface normals via PCA on local k-neighbourhoods."""
+        n = len(pts_3d)
+        if n < k + 1:
+            return np.zeros((n, 3))
+        k = min(k, n - 1)
+        tree = KDTree(pts_3d)
+        _, idx = tree.query(pts_3d, k=k + 1)
+        neighbors = pts_3d[idx[:, 1:]]                          # (N, k, 3)
+        centered = neighbors - neighbors.mean(axis=1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", centered, centered) / k  # (N, 3, 3)
+        _, eigvecs = np.linalg.eigh(cov)                         # (N, 3, 3)
+        return eigvecs[:, :, 0]                                  # (N, 3) smallest eigenvector
 
     def _on_step_size_changed(self):
         self.step_size_ok_button.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
@@ -664,11 +744,13 @@ class CalibrationWidget(QWidget):
             self.dof_widgets["pitch"].value(),
             self.dof_widgets["yaw"].value(),
         )
-        self.extrinsics = np.identity(4)
-        self.extrinsics[:3, 3] = [x, y, z]
-        self.extrinsics[:3, :3] = Rotation.from_euler(
+        # Inputs represent T_lidar→camera; extrinsics = inv(T_lidar→camera)
+        T_lidar_cam = np.identity(4)
+        T_lidar_cam[:3, 3] = [x, y, z]
+        T_lidar_cam[:3, :3] = Rotation.from_euler(
             self.euler_convention, [roll, pitch, yaw], degrees=True
         ).as_matrix()
+        self.extrinsics = np.linalg.inv(T_lidar_cam)
         self.redraw_points()
         self.update_results_display()
         self._highlight_export_button()
@@ -677,8 +759,10 @@ class CalibrationWidget(QWidget):
         self.results_label.setText("Results updated via manual adjustment")
 
     def _update_inputs_from_extrinsics(self):
-        tvec = self.extrinsics[:3, 3]
-        rpy = Rotation.from_matrix(self.extrinsics[:3, :3]).as_euler(
+        # Display T_lidar→camera (inverse of extrinsics) so direction matches initial guess view
+        T_lidar_cam = np.linalg.inv(self.extrinsics)
+        tvec = T_lidar_cam[:3, 3]
+        rpy = Rotation.from_matrix(T_lidar_cam[:3, :3]).as_euler(
             self.euler_convention, degrees=True
         )
         self.dof_widgets["x"].setValue(tvec[0])
@@ -890,17 +974,17 @@ class CalibrationWidget(QWidget):
     def display_image(self):
         # Decode/load the original image if not already done
         if self.original_cv_image is None:
-            if (
-                hasattr(self.image_msg, "_type")
-                and self.image_msg._type == "sensor_msgs/msg/CompressedImage"
-            ):
+            encoding = getattr(self.image_msg, "encoding", "")
+            is_compressed = not encoding or encoding not in self.ros_utils.name_to_dtypes
+            if is_compressed:
                 np_arr = np.frombuffer(self.image_msg.data, np.uint8)
-                self.original_cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                self.original_cv_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             else:
                 self.original_cv_image = self.ros_utils.image_to_numpy(self.image_msg)
 
             # Convert BGR to RGB if needed
-            if "bgr" in self.image_msg.encoding:
+            if not is_compressed and "bgr" in encoding:
                 self.original_cv_image = cv2.cvtColor(self.original_cv_image, cv2.COLOR_BGR2RGB)
 
         # Apply rectification if enabled
@@ -988,7 +1072,6 @@ class CalibrationWidget(QWidget):
         self.project_pointcloud(self.extrinsics, re_read_cloud=False)
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
-        self.apply_view_button.setStyleSheet(self.default_button_style)
 
     def project_pointcloud(self, extrinsics=None, re_read_cloud=True):
         if extrinsics is not None:
@@ -1019,15 +1102,20 @@ class CalibrationWidget(QWidget):
         K = np.array(self.camerainfo_msg.k).reshape(3, 3)
         rvec, _ = cv2.Rodrigues(self.extrinsics[:3, :3])
         tvec = self.extrinsics[:3, 3]
-        # When rectification is disabled, apply distortion to projected points
-        # so they align with the raw (distorted) image
         d_raw = np.array(self.camerainfo_msg.d)
         if self._is_fisheye:
-            dist_coeffs = None if self.is_rectification_enabled else d_raw[:4].reshape(4, 1)
-            points_proj_cv, _ = cv2.fisheye.projectPoints(self.points_xyz.reshape(-1, 1, 3), rvec, tvec, K, dist_coeffs if dist_coeffs is not None else np.zeros((4, 1)))
+            d4 = d_raw[:4].reshape(4, 1)
+            points_proj_cv, _ = cv2.fisheye.projectPoints(
+                self.points_xyz.reshape(-1, 1, 3), rvec, tvec, K, d4
+            )
+            if self.is_rectification_enabled:
+                points_proj_cv = cv2.fisheye.undistortPoints(points_proj_cv, K, d4, P=K)
         else:
-            dist_coeffs = None if self.is_rectification_enabled else d_raw
-            points_proj_cv, _ = cv2.projectPoints(self.points_xyz, rvec, tvec, K, dist_coeffs)
+            points_proj_cv, _ = cv2.projectPoints(self.points_xyz, rvec, tvec, K, d_raw)
+            if self.is_rectification_enabled:
+                points_proj_cv = cv2.undistortPoints(
+                    points_proj_cv.reshape(-1, 1, 2), K, d_raw, P=K
+                )
         points_proj_cv = points_proj_cv.reshape(-1, 2)
         points_cam = (self.extrinsics[:3, :3] @ self.points_xyz.T).T + tvec
         z_cam = points_cam[:, 2]
@@ -1053,28 +1141,51 @@ class CalibrationWidget(QWidget):
         self.kdtree = KDTree(self.points_proj_valid)
         cmap = cm.get_cmap(self.colormap_combo.currentText())
 
-        # Choose coloring mode
         colorization_mode = self.colorization_mode_combo.currentText()
         if colorization_mode == "Distance":
-            # Distance-based coloring: use distance from camera
             valid_points_cam = points_cam[self.valid_indices]
             distances = np.linalg.norm(valid_points_cam, axis=1)
             min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
             norm_values = np.clip((distances - min_val) / (max_val - min_val + 1e-6), 0, 1)
+            colors = cmap(norm_values)
+        elif colorization_mode == "LiDAR Edge":
+            valid_points_cam = points_cam[self.valid_indices]
+            scores = self._compute_lidar_edge_scores(valid_points_cam, self.points_proj_valid)
+            min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
+            norm_values = np.clip((scores - min_val) / (max_val - min_val + 1e-6), 0, 1)
+            colors = cmap(norm_values)
+        elif colorization_mode == "Surface Normals":
+            normals = self._compute_normals(self.points_xyz[self.valid_indices])
+            roll_deg, pitch_deg, yaw_deg = (
+                sb.value() for sb in self._normal_rot_spinboxes
+            )
+            if roll_deg != 0.0 or pitch_deg != 0.0 or yaw_deg != 0.0:
+                R_color = Rotation.from_euler(
+                    "xyz", [roll_deg, pitch_deg, yaw_deg], degrees=True
+                ).as_matrix()
+                normals = normals @ R_color.T
+            rgb = np.abs(normals).clip(0, 1)
+            colors = np.column_stack([rgb, np.ones(len(rgb))])
         else:
-            # Intensity-based coloring (default)
+            # Intensity (default)
             min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
             norm_values = np.clip(
                 (self.intensities_valid - min_val) / (max_val - min_val + 1e-6), 0, 1
             )
+            colors = cmap(norm_values)
 
-        colors = cmap(norm_values)
         colors[:, 3] = 0.8
-        self.point_cloud_item = PointCloudItem(
-            self.points_proj_valid, colors, self.point_size_spinbox.value(),
-            opacity=self.opacity_spinbox.value()
-        )
-        self.scene.addItem(self.point_cloud_item)
+        if self.point_cloud_item is not None and self.point_cloud_item.scene():
+            self.point_cloud_item.update_data(
+                self.points_proj_valid, colors,
+                self.point_size_spinbox.value(), self.opacity_spinbox.value()
+            )
+        else:
+            self.point_cloud_item = PointCloudItem(
+                self.points_proj_valid, colors, self.point_size_spinbox.value(),
+                opacity=self.opacity_spinbox.value()
+            )
+            self.scene.addItem(self.point_cloud_item)
 
     def project_second_pointcloud(self, transform=None):
         """Project the second point cloud using the current transformation."""
@@ -1111,15 +1222,20 @@ class CalibrationWidget(QWidget):
         K = np.array(self.camerainfo_msg.k).reshape(3, 3)
         rvec, _ = cv2.Rodrigues(self.extrinsics[:3, :3])
         tvec = self.extrinsics[:3, 3]
-        # When rectification is disabled, apply distortion to projected points
-        # so they align with the raw (distorted) image
         d_raw = np.array(self.camerainfo_msg.d)
         if self._is_fisheye:
-            dist_coeffs = None if self.is_rectification_enabled else d_raw[:4].reshape(4, 1)
-            points_proj_cv, _ = cv2.fisheye.projectPoints(transformed_points.reshape(-1, 1, 3), rvec, tvec, K, dist_coeffs if dist_coeffs is not None else np.zeros((4, 1)))
+            d4 = d_raw[:4].reshape(4, 1)
+            points_proj_cv, _ = cv2.fisheye.projectPoints(
+                transformed_points.reshape(-1, 1, 3), rvec, tvec, K, d4
+            )
+            if self.is_rectification_enabled:
+                points_proj_cv = cv2.fisheye.undistortPoints(points_proj_cv, K, d4, P=K)
         else:
-            dist_coeffs = None if self.is_rectification_enabled else d_raw
-            points_proj_cv, _ = cv2.projectPoints(transformed_points, rvec, tvec, K, dist_coeffs)
+            points_proj_cv, _ = cv2.projectPoints(transformed_points, rvec, tvec, K, d_raw)
+            if self.is_rectification_enabled:
+                points_proj_cv = cv2.undistortPoints(
+                    points_proj_cv.reshape(-1, 1, 2), K, d_raw, P=K
+                )
         points_proj_cv = points_proj_cv.reshape(-1, 2)
 
         # Transform to camera coordinates to check visibility
@@ -1163,10 +1279,16 @@ class CalibrationWidget(QWidget):
         colors = second_cmap(norm_values)
         colors[:, 3] = 0.7  # Slightly more transparent to distinguish from master
 
-        self.second_point_cloud_item = PointCloudItem(
-            self.second_points_proj_valid, colors, self.point_size_spinbox.value()
-        )
-        self.scene.addItem(self.second_point_cloud_item)
+        if self.second_point_cloud_item is not None and self.second_point_cloud_item.scene():
+            self.second_point_cloud_item.update_data(
+                self.second_points_proj_valid, colors,
+                self.point_size_spinbox.value(), self.opacity_spinbox.value()
+            )
+        else:
+            self.second_point_cloud_item = PointCloudItem(
+                self.second_points_proj_valid, colors, self.point_size_spinbox.value()
+            )
+            self.scene.addItem(self.second_point_cloud_item)
 
     def update_corr_list(self):
         self.corr_list_widget.clear()

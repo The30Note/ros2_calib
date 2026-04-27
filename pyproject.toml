@@ -31,7 +31,8 @@ dependencies = [
     "NodeGraphQt",
     "transforms3d",
     "setuptools",
-    "open3d"
+    "open3d",
+    "pyyaml"
 ]
 
 [project.urls]
@@ -54,6 +55,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["ros2_calib"]
+
+[tool.setuptools.package-data]
+ros2_calib = ["data/*.yaml"]
 
 [tool.ruff]
 line-length = 100

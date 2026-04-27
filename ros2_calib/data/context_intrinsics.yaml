@@ -1,0 +1,20 @@
+image_width: 2592
+image_height: 1944
+camera_name: context_main
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1185.23, 0.0, 1316.73, 0.0, 1188.14, 1017.96, 0.0, 0.0, 1.0]
+distortion_model: fisheye
+distortion_coefficients:
+  rows: 1
+  cols: 4
+  data: [0.00567, -0.00653, -0.01866, 0.01397]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1185.23, 0.0, 1316.73, 0.0, 0.0, 1188.14, 1017.96, 0.0, 0.0, 0.0, 1.0, 0.0]

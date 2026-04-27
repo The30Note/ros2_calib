@@ -20,17 +20,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import datetime
 import os
 from typing import Dict, List, Optional
 
+import yaml
+
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
     QGraphicsDropShadowEffect,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -62,6 +69,21 @@ from .lidar2lidar_o3d_widget import launch_lidar2lidar_calibration
 from .tf_graph_widget import TFGraphWidget
 
 
+class _IntrinsicsPreviewView(QGraphicsView):
+    """Scrollable/zoomable view for the intrinsics preview image."""
+
+    def __init__(self, scene: QGraphicsScene, parent=None):
+        super().__init__(scene, parent)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setMinimumHeight(360)
+
+    def wheelEvent(self, event: QWheelEvent):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+
 class MainWindow(QMainWindow):
     # Signal for thread-safe calibration completion
     calibration_completed = Signal(np.ndarray)
@@ -81,19 +103,22 @@ class MainWindow(QMainWindow):
         self.selected_topics = {}
         self.tf_tree = {}
         self.current_transform = np.eye(4, dtype=np.float64)
-        self.calibration_type = "LiDAR2Cam"  # Default type
+        self.calibration_type = "LiDAR2Cam_Context"  # Default type
         self.calibrated_transform = np.eye(4, dtype=np.float64)
         self.original_source_frame = ""
         self.original_target_frame = ""
         self.tf_graph_window = None  # To hold a reference to the pop-up window
+        self.active_camerainfo_msg = None
 
         # Set up stacked widget for multiple views
         self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
 
-        # Create and add the different views
+        # Create and add the different views (order determines stacked widget indices)
+        # 0: type selection, 1: load, 2: intrinsics, 3: transform, 4: frames, 5: results
         self.setup_calibration_type_view()
         self.setup_load_view()
+        self.setup_intrinsics_view()
         self.setup_transform_view()
         self.setup_frame_selection_view()
         self.setup_results_view()
@@ -120,7 +145,6 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout(button_container)
         button_layout.addStretch()
 
-        self.lidar2cam_button = QPushButton("LiDAR ↔ Camera\nCalibration")
         large_button_style = (
             UIStyles.HIGHLIGHT_BUTTON
             + """
@@ -145,12 +169,25 @@ class MainWindow(QMainWindow):
         }
         """
         )
-        self.lidar2cam_button.setStyleSheet(large_button_style)
-        self.lidar2cam_button.clicked.connect(lambda: self.select_calibration_type("LiDAR2Cam"))
-        self._apply_button_shadow(self.lidar2cam_button)
-        button_layout.addWidget(self.lidar2cam_button)
 
-        # Add spacing between buttons
+        self.lidar2cam_context_button = QPushButton("LiDAR ↔ Context Camera\nCalibration")
+        self.lidar2cam_context_button.setStyleSheet(large_button_style)
+        self.lidar2cam_context_button.clicked.connect(
+            lambda: self.select_calibration_type("LiDAR2Cam_Context")
+        )
+        self._apply_button_shadow(self.lidar2cam_context_button)
+        button_layout.addWidget(self.lidar2cam_context_button)
+
+        button_layout.addSpacing(40)
+
+        self.lidar2cam_zoom_button = QPushButton("LiDAR ↔ Zoom Camera\nCalibration")
+        self.lidar2cam_zoom_button.setStyleSheet(large_button_style)
+        self.lidar2cam_zoom_button.clicked.connect(
+            lambda: self.select_calibration_type("LiDAR2Cam_Zoom")
+        )
+        self._apply_button_shadow(self.lidar2cam_zoom_button)
+        button_layout.addWidget(self.lidar2cam_zoom_button)
+
         button_layout.addSpacing(40)
 
         self.lidar2lidar_button = QPushButton("LiDAR ↔ LiDAR\nCalibration")
@@ -178,21 +215,52 @@ class MainWindow(QMainWindow):
         shadow.setColor(QColor(0, 0, 0, 90))
         button.setGraphicsEffect(shadow)
 
+    @property
+    def _is_lidar_cam(self) -> bool:
+        return self.calibration_type in ("LiDAR2Cam_Context", "LiDAR2Cam_Zoom")
+
+    @property
+    def _camera_type_label(self) -> str:
+        """Short label for the selected camera type: 'context' or 'zoom'."""
+        if self.calibration_type == "LiDAR2Cam_Context":
+            return "context"
+        if self.calibration_type == "LiDAR2Cam_Zoom":
+            return "zoom"
+        return ""
+
+    @property
+    def _child_frame(self) -> str:
+        """Known child frame for the selected LiDAR-to-Camera calibration type."""
+        if self.calibration_type == "LiDAR2Cam_Context":
+            return "context_camera_frame"
+        if self.calibration_type == "LiDAR2Cam_Zoom":
+            return "zoom_camera_frame"
+        return getattr(self, "camera_frame", "")
+
+    @property
+    def _parent_frame(self) -> str:
+        """Known parent (LiDAR) frame for LiDAR-to-Camera calibration."""
+        return "livox_frame"
+
     def update_load_view_for_calibration_type(self):
         """Update load view UI based on selected calibration type."""
-        is_lidar_cam = self.calibration_type == "LiDAR2Cam"
-        self.image_label.setVisible(is_lidar_cam)
-        self.image_topic_combo.setVisible(is_lidar_cam)
-        self.camerainfo_label.setVisible(is_lidar_cam)
-        self.camerainfo_topic_combo.setVisible(is_lidar_cam)
-        self.pointcloud2_label.setVisible(not is_lidar_cam)
-        self.pointcloud2_topic_combo.setVisible(not is_lidar_cam)
+        self.image_label.setVisible(self._is_lidar_cam)
+        self.image_topic_combo.setVisible(self._is_lidar_cam)
+        self.camerainfo_label.setVisible(self._is_lidar_cam)
+        self.camerainfo_topic_combo.setVisible(self._is_lidar_cam)
+        self.pointcloud2_label.setVisible(not self._is_lidar_cam)
+        self.pointcloud2_topic_combo.setVisible(not self._is_lidar_cam)
         self.pointcloud_label.setText(
-            "PointCloud2 Topic:" if is_lidar_cam else "PointCloud2 Topic (Source):"
+            "PointCloud2 Topic:" if self._is_lidar_cam else "PointCloud2 Topic (Source):"
         )
-        self.selection_group.setTitle(f"Topic Selection for {self.calibration_type} Calibration")
+        type_label = {
+            "LiDAR2Cam_Context": "LiDAR ↔ Context Camera",
+            "LiDAR2Cam_Zoom": "LiDAR ↔ Zoom Camera",
+            "LiDAR2LiDAR": "LiDAR ↔ LiDAR",
+        }.get(self.calibration_type, self.calibration_type)
+        self.selection_group.setTitle(f"Topic Selection — {type_label}")
         self.proceed_button.setText(
-            "Proceed to Frame Selection" if is_lidar_cam else "Proceed to Transform Selection"
+            "Proceed to Intrinsics" if self._is_lidar_cam else "Proceed to Transform Selection"
         )
 
     def setup_load_view(self):
@@ -204,7 +272,7 @@ class MainWindow(QMainWindow):
         load_section_layout.addWidget(self.load_bag_button)
         load_section_layout.addWidget(QLabel("ROS Version:"))
         self.ros_version_combo = QComboBox()
-        self.ros_version_combo.addItems(["JAZZY", "HUMBLE"])
+        self.ros_version_combo.addItems(["HUMBLE", "JAZZY"])
         load_section_layout.addWidget(self.ros_version_combo)
         drag_drop_label = QLabel("or Drag & Drop")
         drag_drop_label.setStyleSheet("color: #666; font-style: italic;")
@@ -256,6 +324,320 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.load_widget)
         self.update_load_view_for_calibration_type()
 
+    def setup_intrinsics_view(self):
+        self.intrinsics_widget = QWidget()
+        outer = QVBoxLayout(self.intrinsics_widget)
+
+        self.intrinsics_title_label = QLabel()
+        self.intrinsics_title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin: 8px;")
+        outer.addWidget(self.intrinsics_title_label)
+
+        back_row = QHBoxLayout()
+        back_btn = QPushButton("← Back to Topic Selection")
+        back_btn.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+        back_row.addWidget(back_btn)
+        back_row.addStretch()
+        outer.addLayout(back_row)
+
+        # --- left / right split ---
+        content_row = QHBoxLayout()
+        outer.addLayout(content_row, stretch=1)
+
+        # Left panel — source selection + intrinsics text
+        left = QVBoxLayout()
+        content_row.addLayout(left, stretch=1)
+
+        source_group = QGroupBox("Intrinsics Source")
+        source_row = QHBoxLayout(source_group)
+        self.intrinsics_default_btn = QPushButton("Use Default File")
+        self.intrinsics_default_btn.clicked.connect(self._load_default_intrinsics)
+        self.intrinsics_file_btn = QPushButton("Load from File…")
+        self.intrinsics_file_btn.clicked.connect(self._browse_intrinsics_file)
+        self.intrinsics_rosbag_btn = QPushButton("Use Rosbag Topic")
+        self.intrinsics_rosbag_btn.clicked.connect(self._use_rosbag_intrinsics)
+        source_row.addWidget(self.intrinsics_default_btn)
+        source_row.addWidget(self.intrinsics_file_btn)
+        source_row.addWidget(self.intrinsics_rosbag_btn)
+        source_row.addStretch()
+        left.addWidget(source_group)
+
+        self.intrinsics_source_label = QLabel()
+        self.intrinsics_source_label.setStyleSheet("color: #666; font-style: italic; margin: 4px;")
+        left.addWidget(self.intrinsics_source_label)
+
+        display_group = QGroupBox("Loaded Intrinsics")
+        display_layout = QVBoxLayout(display_group)
+        self.intrinsics_display = QTextEdit(readOnly=True, fontFamily="monospace")
+        display_layout.addWidget(self.intrinsics_display)
+        left.addWidget(display_group, stretch=1)
+
+        # Right panel — image preview with grid overlay
+        right = QVBoxLayout()
+        content_row.addLayout(right, stretch=2)
+
+        preview_group = QGroupBox("Intrinsics Preview")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self._intrinsics_scene = QGraphicsScene()
+        self._intrinsics_pixmap_item = None
+        self._intrinsics_view = _IntrinsicsPreviewView(self._intrinsics_scene)
+        preview_layout.addWidget(self._intrinsics_view)
+
+        self.intrinsics_rectify_check = QCheckBox("Rectify Image (undistort)")
+        self.intrinsics_rectify_check.toggled.connect(self._render_intrinsics_preview)
+        preview_layout.addWidget(self.intrinsics_rectify_check)
+
+        right.addWidget(preview_group, stretch=1)
+
+        # Continue button
+        continue_row = QHBoxLayout()
+        continue_row.addStretch()
+        self.intrinsics_continue_btn = QPushButton("Continue to Frame Selection →")
+        self.intrinsics_continue_btn.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
+        self.intrinsics_continue_btn.setEnabled(False)
+        self.intrinsics_continue_btn.clicked.connect(self._intrinsics_continue)
+        continue_row.addWidget(self.intrinsics_continue_btn)
+        outer.addLayout(continue_row)
+
+        self.stacked_widget.addWidget(self.intrinsics_widget)
+
+    def _open_intrinsics_view(self):
+        label = self._camera_type_label.capitalize()
+        self.intrinsics_title_label.setText(f"Camera Intrinsics — {label} Camera")
+        has_rosbag_topic = bool(
+            getattr(self, "selected_topics_data", {}).get("camerainfo_topic", "")
+        )
+        self.intrinsics_rosbag_btn.setEnabled(has_rosbag_topic)
+        self.intrinsics_rectify_check.blockSignals(True)
+        self.intrinsics_rectify_check.setChecked(False)
+        self.intrinsics_rectify_check.blockSignals(False)
+        self._load_default_intrinsics()
+        self.stacked_widget.setCurrentIndex(2)
+
+    def _load_default_intrinsics(self):
+        data_dir = os.path.join(os.path.dirname(__file__), "data")
+        path = os.path.join(data_dir, f"{self._camera_type_label}_intrinsics.yaml")
+        if os.path.exists(path):
+            self.active_camerainfo_msg = self._parse_camera_info_yaml(path)
+            self.intrinsics_source_label.setText(
+                f"Source: Default file ({os.path.basename(path)})"
+            )
+            self._refresh_intrinsics_display()
+        else:
+            self.intrinsics_source_label.setText("Default file not found.")
+            self.intrinsics_display.setPlainText("")
+            self.active_camerainfo_msg = None
+            self.intrinsics_continue_btn.setEnabled(False)
+
+    def _browse_intrinsics_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Camera Intrinsics", "", "YAML Files (*.yaml *.yml)"
+        )
+        if path:
+            try:
+                self.active_camerainfo_msg = self._parse_camera_info_yaml(path)
+                self.intrinsics_source_label.setText(f"Source: {path}")
+                self._refresh_intrinsics_display()
+            except Exception as e:
+                self.intrinsics_display.setPlainText(f"Error loading file:\n{e}")
+                self.intrinsics_continue_btn.setEnabled(False)
+
+    def _use_rosbag_intrinsics(self):
+        from .bag_handler import convert_to_mock
+
+        camerainfo_topic = getattr(self, "selected_topics_data", {}).get("camerainfo_topic", "")
+        raw = None
+        if camerainfo_topic and hasattr(self, "frame_samples"):
+            samples = self.frame_samples.get(camerainfo_topic)
+            if samples:
+                raw = samples[0]["data"]
+        elif camerainfo_topic and hasattr(self, "selected_topics"):
+            raw = self.selected_topics.get("raw_messages", {}).get(camerainfo_topic)
+
+        if raw is None:
+            self.intrinsics_source_label.setText("No camera_info data found in rosbag.")
+            return
+
+        self.active_camerainfo_msg = convert_to_mock(
+            raw, self.topic_types.get(camerainfo_topic, "sensor_msgs/msg/CameraInfo")
+        )
+        self.intrinsics_source_label.setText(f"Source: Rosbag topic ({camerainfo_topic})")
+        self._refresh_intrinsics_display()
+
+    def _refresh_intrinsics_display(self):
+        msg = self.active_camerainfo_msg
+        if msg is None:
+            self.intrinsics_display.setPlainText("No intrinsics loaded.")
+            self.intrinsics_continue_btn.setEnabled(False)
+            return
+        k = list(msg.k)
+        fx, fy = k[0], k[4]
+        cx, cy = k[2], k[5]
+        coeffs = ", ".join(f"{v:.6g}" for v in msg.d)
+        text = (
+            f"Image:        {msg.width} × {msg.height}\n"
+            f"Camera name:  {getattr(msg, 'camera_name', '—')}\n"
+            f"fx:           {fx:.5g}\n"
+            f"fy:           {fy:.5g}\n"
+            f"cx:           {cx:.5g}\n"
+            f"cy:           {cy:.5g}\n"
+            f"Distortion:   {msg.distortion_model}\n"
+            f"Coefficients: [{coeffs}]"
+        )
+        self.intrinsics_display.setPlainText(text)
+        self.intrinsics_continue_btn.setEnabled(True)
+        self._render_intrinsics_preview()
+
+    def _render_intrinsics_preview(self):
+        """Render the first frame image with a projected 3D grid overlay."""
+        msg = self.active_camerainfo_msg
+        if msg is None:
+            return
+
+        # Get raw image from first available frame sample
+        image_topic = getattr(self, "selected_topics_data", {}).get("image_topic", "")
+        raw_img = None
+        if image_topic and hasattr(self, "frame_samples"):
+            samples = self.frame_samples.get(image_topic)
+            if samples:
+                raw_img = samples[0]["data"]
+        if raw_img is None and hasattr(self, "selected_topics"):
+            raw_img = self.selected_topics.get("raw_messages", {}).get(image_topic)
+        if raw_img is None:
+            return
+
+        try:
+            encoding = getattr(raw_img, "encoding", "")
+            if not encoding or encoding not in ros_utils.name_to_dtypes:
+                np_arr = np.frombuffer(raw_img.data, np.uint8)
+                bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = ros_utils.image_to_numpy(raw_img)
+                if "bgr" in encoding:
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            print(f"[WARNING] Could not decode preview image: {e}")
+            return
+
+        K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        D = np.array(msg.d, dtype=np.float64)
+        is_fisheye = msg.distortion_model.lower() in ("fisheye", "equidistant")
+        rectified = self.intrinsics_rectify_check.isChecked()
+
+        if rectified:
+            try:
+                if is_fisheye:
+                    bgr_in = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    bgr_out = cv2.fisheye.undistortImage(
+                        bgr_in, K, D[:4].reshape(4, 1), None, K
+                    )
+                    rgb = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
+                else:
+                    bgr_in = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    bgr_out = cv2.undistort(bgr_in, K, D, None, K)
+                    rgb = cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
+            except Exception as e:
+                print(f"[WARNING] Undistort failed: {e}")
+
+        rgb = self._draw_grid_on_image(rgb, K, D, is_fisheye, rectified)
+
+        h, w = rgb.shape[:2]
+        q_img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+        if self._intrinsics_pixmap_item is None:
+            self._intrinsics_pixmap_item = self._intrinsics_scene.addPixmap(pixmap)
+        else:
+            self._intrinsics_pixmap_item.setPixmap(pixmap)
+        self._intrinsics_scene.setSceneRect(0, 0, w, h)
+        self._intrinsics_view.fitInView(
+            self._intrinsics_scene.sceneRect(), Qt.KeepAspectRatio
+        )
+
+    def _draw_grid_on_image(
+        self,
+        image_rgb: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+        is_fisheye: bool,
+        rectified: bool,
+    ) -> np.ndarray:
+        """Draw a projected 3D grid onto image_rgb and return the annotated copy."""
+        h, w = image_rgb.shape[:2]
+        n_lines = 9
+        n_pts = 40  # polyline resolution per line
+        depth = 1.0
+
+        fx, fy = K[0, 0], K[1, 1]
+        # Span slightly wider than the image FOV
+        x_half = (w / 2) / fx * 1.05
+        y_half = (h / 2) / fy * 1.05
+
+        xs = np.linspace(-x_half, x_half, n_lines)
+        ys = np.linspace(-y_half, y_half, n_lines)
+        along_x = np.linspace(-x_half, x_half, n_pts)
+        along_y = np.linspace(-y_half, y_half, n_pts)
+
+        # Use zero distortion when drawing on the undistorted image
+        D_use = np.zeros_like(D) if rectified else D
+        rvec = tvec = np.zeros(3)
+        out = image_rgb.copy()
+
+        def project(pts_3d):
+            pts = pts_3d.reshape(-1, 1, 3).astype(np.float64)
+            try:
+                if is_fisheye and not rectified:
+                    d4 = D_use[:4].reshape(4, 1)
+                    proj, _ = cv2.fisheye.projectPoints(pts, rvec, tvec, K, d4)
+                else:
+                    proj, _ = cv2.projectPoints(pts, rvec, tvec, K, D_use)
+                return proj.reshape(-1, 2)
+            except Exception:
+                return np.empty((0, 2))
+
+        def draw_poly(pts2d):
+            for i in range(len(pts2d) - 1):
+                x1, y1 = int(round(pts2d[i][0])), int(round(pts2d[i][1]))
+                x2, y2 = int(round(pts2d[i + 1][0])), int(round(pts2d[i + 1][1]))
+                if max(abs(x1), abs(x2)) < w * 3 and max(abs(y1), abs(y2)) < h * 3:
+                    cv2.line(out, (x1, y1), (x2, y2), (0, 220, 0), 1, cv2.LINE_AA)
+
+        # Horizontal grid lines (fixed y, varying x)
+        for y_val in ys:
+            pts = np.column_stack([along_x, np.full(n_pts, y_val), np.full(n_pts, depth)])
+            draw_poly(project(pts))
+
+        # Vertical grid lines (fixed x, varying y)
+        for x_val in xs:
+            pts = np.column_stack([np.full(n_pts, x_val), along_y, np.full(n_pts, depth)])
+            draw_poly(project(pts))
+
+        return out
+
+    def _intrinsics_continue(self):
+        self.stacked_widget.setCurrentIndex(4)  # Frame selection view
+
+    def _go_back_from_transform(self):
+        if self._is_lidar_cam:
+            self.stacked_widget.setCurrentIndex(4)  # Back to frame selection
+        else:
+            self.stacked_widget.setCurrentIndex(1)  # Back to load view
+
+    def _parse_camera_info_yaml(self, path: str):
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        msg = ros_utils.CameraInfo(
+            height=data["image_height"],
+            width=data["image_width"],
+            distortion_model=data["distortion_model"],
+            k=data["camera_matrix"]["data"],
+            d=data["distortion_coefficients"]["data"],
+            r=data["rectification_matrix"]["data"],
+            p=data["projection_matrix"]["data"],
+        )
+        msg.camera_name = data.get("camera_name", "")
+        return msg
+
     def setup_transform_view(self):
         self.transform_widget = QWidget()
         self.transform_layout = QVBoxLayout(self.transform_widget)
@@ -264,8 +646,8 @@ class MainWindow(QMainWindow):
         self.transform_layout.addWidget(self.tf_title_label)
 
         back_button_layout = QHBoxLayout()
-        self.back_button = QPushButton("← Back to Topic Selection")
-        self.back_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+        self.back_button = QPushButton("← Back")
+        self.back_button.clicked.connect(self._go_back_from_transform)
         back_button_layout.addWidget(self.back_button)
         back_button_layout.addStretch()
         self.transform_layout.addLayout(back_button_layout)
@@ -306,7 +688,7 @@ class MainWindow(QMainWindow):
         manual_layout.addWidget(self.tx_input, 0, 1)
         manual_layout.addWidget(self.ty_input, 0, 2)
         manual_layout.addWidget(self.tz_input, 0, 3)
-        manual_layout.addWidget(QLabel("Rotation (roll, pitch, yaw) [rad]:"), 1, 0)
+        manual_layout.addWidget(QLabel("Rotation (roll, pitch, yaw) [deg]:"), 1, 0)
         manual_layout.addWidget(self.rx_input, 1, 1)
         manual_layout.addWidget(self.ry_input, 1, 2)
         manual_layout.addWidget(self.rz_input, 1, 3)
@@ -410,7 +792,9 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
 
     def load_bag(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Rosbag", "", "MCAP Rosbag (*.mcap)")
+        bags_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bags")
+        start_dir = bags_dir if os.path.isdir(bags_dir) else os.path.dirname(os.path.dirname(__file__))
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Rosbag", start_dir, "MCAP Rosbag (*.mcap)")
         if file_path:
             self.load_bag_from_path(file_path)
 
@@ -483,13 +867,40 @@ class MainWindow(QMainWindow):
         self.pointcloud_topic_combo.addItems(topic_types["pointcloud"])
         self.pointcloud2_topic_combo.addItems(topic_types["pointcloud"])
         self.camerainfo_topic_combo.addItems(topic_types["camerainfo"])
-        if self.calibration_type == "LiDAR2Cam" and self.image_topic_combo.count():
-            self.auto_select_camera_info(self.image_topic_combo.currentIndex())
-        else:
-            self.update_proceed_button_state()
+        self._auto_select_topics()
+        self.update_proceed_button_state()
+
+    def _auto_select_topics(self):
+        """Auto-select topics based on calibration type using known naming conventions."""
+        preferred = {
+            "LiDAR2Cam_Context": {
+                "image": "/context_camera/main",
+                "camerainfo": "/context_camera/camera_info",
+                "pointcloud": "/livox/lidar",
+            },
+            "LiDAR2Cam_Zoom": {
+                "image": "/zoom_camera/main",
+                "camerainfo": "/zoom_camera/camera_info",
+                "pointcloud": "/livox/lidar",
+            },
+            "LiDAR2LiDAR": {
+                "pointcloud": "/livox/lidar",
+            },
+        }.get(self.calibration_type, {})
+
+        def _select(combo, topic):
+            idx = combo.findText(topic, Qt.MatchExactly)
+            if idx != -1:
+                combo.setCurrentIndex(idx)
+
+        _select(self.pointcloud_topic_combo, preferred.get("pointcloud", ""))
+        _select(self.pointcloud2_topic_combo, preferred.get("pointcloud", ""))
+        if self._is_lidar_cam:
+            _select(self.image_topic_combo, preferred.get("image", ""))
+            _select(self.camerainfo_topic_combo, preferred.get("camerainfo", ""))
 
     def auto_select_camera_info(self, index):
-        if self.calibration_type != "LiDAR2Cam" or index == -1:
+        if not self._is_lidar_cam or index == -1:
             self.update_proceed_button_state()
             return
 
@@ -580,7 +991,7 @@ class MainWindow(QMainWindow):
         self.update_proceed_button_state()
 
     def validate_lidar_topic_selection(self):
-        if self.calibration_type != "LiDAR2LiDAR":
+        if self._is_lidar_cam:
             return
         source_topic = self.pointcloud_topic_combo.currentText()
         target_topic = self.pointcloud2_topic_combo.currentText()
@@ -594,12 +1005,11 @@ class MainWindow(QMainWindow):
         self.update_proceed_button_state()
 
     def update_proceed_button_state(self):
-        if self.calibration_type == "LiDAR2Cam":
+        if self._is_lidar_cam:
             is_valid = all(
                 [
                     self.image_topic_combo.currentText(),
                     self.pointcloud_topic_combo.currentText(),
-                    self.camerainfo_topic_combo.currentText(),
                 ]
             )
         else:
@@ -628,7 +1038,7 @@ class MainWindow(QMainWindow):
             if "tf" in topic.lower() and "TFMessage" in topic_types[topic]
         ]
 
-        if self.calibration_type == "LiDAR2Cam":
+        if self._is_lidar_cam:
             selected_topics_data = {
                 "calibration_type": self.calibration_type,
                 "image_topic": self.image_topic_combo.currentText(),
@@ -709,21 +1119,24 @@ class MainWindow(QMainWindow):
             print("[DEBUG] Processing multi-frame samples.")
             self.frame_samples = raw_messages["frame_samples"]
 
-            if self.calibration_type == "LiDAR2Cam":
+            if self._is_lidar_cam:
                 pointcloud_topic = selected_topics_data["pointcloud_topic"]
-                camerainfo_topic = selected_topics_data["camerainfo_topic"]
+                camerainfo_topic = selected_topics_data.get("camerainfo_topic", "")
 
                 self.lidar_frame = self.extract_frame_id(
                     self.frame_samples[pointcloud_topic][0]["data"]
                 )
-                self.camera_frame = self.extract_frame_id(
-                    self.frame_samples[camerainfo_topic][0]["data"]
-                )
+                if camerainfo_topic and camerainfo_topic in self.frame_samples:
+                    self.camera_frame = self.extract_frame_id(
+                        self.frame_samples[camerainfo_topic][0]["data"]
+                    )
+                else:
+                    self.camera_frame = self._child_frame
 
                 self.frame_selection_widget.set_frame_samples(
                     self.frame_samples, selected_topics_data["image_topic"]
                 )
-                self.stacked_widget.setCurrentIndex(3)  # Switch to Frame Selection View
+                self._open_intrinsics_view()
 
             else:  # LiDAR2LiDAR multi-frame (take the first)
                 pointcloud_topic = selected_topics_data["pointcloud_topic"]
@@ -746,7 +1159,7 @@ class MainWindow(QMainWindow):
         else:
             # Fallback for workers that return a single message set (flat dictionary).
             print("[DEBUG] Processing single message set (no 'frame_samples' key found).")
-            if self.calibration_type == "LiDAR2LiDAR":
+            if not self._is_lidar_cam:
                 pointcloud_topic = selected_topics_data["pointcloud_topic"]
                 pointcloud2_topic = selected_topics_data["pointcloud2_topic"]
 
@@ -760,10 +1173,13 @@ class MainWindow(QMainWindow):
             else:  # Fallback for LiDAR2Cam single frame
                 image_topic = selected_topics_data["image_topic"]
                 pointcloud_topic = selected_topics_data["pointcloud_topic"]
-                camerainfo_topic = selected_topics_data["camerainfo_topic"]
+                camerainfo_topic = selected_topics_data.get("camerainfo_topic", "")
 
                 self.lidar_frame = self.extract_frame_id(raw_messages[pointcloud_topic])
-                self.camera_frame = self.extract_frame_id(raw_messages[camerainfo_topic])
+                if camerainfo_topic and camerainfo_topic in raw_messages:
+                    self.camera_frame = self.extract_frame_id(raw_messages[camerainfo_topic])
+                else:
+                    self.camera_frame = self._child_frame
 
                 self.selected_topics = {
                     "image_topic": image_topic,
@@ -773,14 +1189,11 @@ class MainWindow(QMainWindow):
                     "raw_messages": {
                         topic: raw_messages.get(topic)
                         for topic in [image_topic, pointcloud_topic, camerainfo_topic]
+                        if topic
                     },
                     "tf_messages": self.tf_messages,
                 }
-                self.tf_title_label.setText(
-                    f"Select Initial Transformation: {self.lidar_frame} → {self.camera_frame}"
-                )
-                self.load_tf_topics_in_transform_view()
-                self.stacked_widget.setCurrentIndex(2)  # Switch to Transform View
+                self._open_intrinsics_view()
 
         if hasattr(self, "processing_worker") and self.processing_worker:
             self.processing_worker.deleteLater()
@@ -809,7 +1222,7 @@ class MainWindow(QMainWindow):
             f"Select Initial Transformation: {self.lidar_frame} → {self.lidar2_frame}"
         )
         self.load_tf_topics_in_transform_view()
-        self.stacked_widget.setCurrentIndex(2)  # Switch to Transform View
+        self.stacked_widget.setCurrentIndex(3)  # Switch to Transform View
 
     def on_frame_selected(self, frame_index: int):
         print(f"[DEBUG] Frame {frame_index + 1} selected for LiDAR2Cam calibration.")
@@ -829,10 +1242,10 @@ class MainWindow(QMainWindow):
             "tf_messages": self.tf_messages,
         }
         self.tf_title_label.setText(
-            f"Select Initial Transformation: {self.lidar_frame} → {self.camera_frame}"
+            f"Initial Transform: {self._parent_frame} → {self._child_frame} (deg)"
         )
         self.load_tf_topics_in_transform_view()
-        self.stacked_widget.setCurrentIndex(2)
+        self.stacked_widget.setCurrentIndex(3)
 
     def on_frames_accumulated(self, image_frame_index: int):
         """Merge all LiDAR frames into one dense cloud and proceed with the selected image frame."""
@@ -879,10 +1292,10 @@ class MainWindow(QMainWindow):
             "tf_messages": self.tf_messages,
         }
         self.tf_title_label.setText(
-            f"Select Initial Transformation: {self.lidar_frame} → {self.camera_frame}"
+            f"Initial Transform: {self._parent_frame} → {self._child_frame} (deg)"
         )
         self.load_tf_topics_in_transform_view()
-        self.stacked_widget.setCurrentIndex(2)
+        self.stacked_widget.setCurrentIndex(3)
 
     def on_processing_failed(self, error_message):
         print(f"[ERROR] Rosbag processing failed: {error_message}")
@@ -897,12 +1310,12 @@ class MainWindow(QMainWindow):
         return getattr(getattr(msg, "header", None), "frame_id", "unknown_frame")
 
     def proceed_to_calibration(self, initial_transform):
-        for i in range(self.stacked_widget.count() - 1, 4, -1):
+        for i in range(self.stacked_widget.count() - 1, 5, -1):
             widget = self.stacked_widget.widget(i)
             self.stacked_widget.removeWidget(widget)
             widget.deleteLater()
 
-        if self.calibration_type == "LiDAR2LiDAR":
+        if not self._is_lidar_cam:
             self.proceed_to_lidar_calibration_with_transform(initial_transform)
             return
 
@@ -914,7 +1327,7 @@ class MainWindow(QMainWindow):
             self.selected_topics["raw_messages"][self.selected_topics["pointcloud_topic"]],
             self.selected_topics["topic_types"][self.selected_topics["pointcloud_topic"]],
         )
-        camerainfo_msg = convert_to_mock(
+        camerainfo_msg = self.active_camerainfo_msg or convert_to_mock(
             self.selected_topics["raw_messages"][self.selected_topics["camerainfo_topic"]],
             self.selected_topics["topic_types"][self.selected_topics["camerainfo_topic"]],
         )
@@ -954,7 +1367,7 @@ class MainWindow(QMainWindow):
         self.calibration_completed.emit(final_transform)
 
     def go_back_to_calibration(self):
-        if self.calibration_type == "LiDAR2LiDAR":
+        if not self._is_lidar_cam:
             self.restart_lidar_calibration()
             return
         for i in range(self.stacked_widget.count()):
@@ -963,7 +1376,7 @@ class MainWindow(QMainWindow):
                 return
 
     def get_results_view_index(self):
-        return 4
+        return 5
 
     def restart_lidar_calibration(self):
         raw_msgs = self.selected_topics.get("raw_messages")
@@ -1065,7 +1478,7 @@ class MainWindow(QMainWindow):
         if not self.tf_tree:
             return
         source = self.lidar_frame
-        target = self.camera_frame if self.calibration_type == "LiDAR2Cam" else self.lidar2_frame
+        target = self.camera_frame if self._is_lidar_cam else self.lidar2_frame
         if (transform_matrix := self.find_transform_path(source, target)) is not None:
             self.current_transform = transform_matrix
             self.update_transform_display()
@@ -1132,7 +1545,7 @@ class MainWindow(QMainWindow):
             self.tf_info_text.setPlainText("No TF data available.")
             return
         source = self.lidar_frame
-        target = self.camera_frame if self.calibration_type == "LiDAR2Cam" else self.lidar2_frame
+        target = self.camera_frame if self._is_lidar_cam else self.lidar2_frame
         path_frames = self.find_transformation_path_frames(source, target)
         path_info = (
             f"\n✓ Found transformation path: {' → '.join(path_frames)}"
@@ -1147,7 +1560,7 @@ class MainWindow(QMainWindow):
         if not self.tf_tree:
             return
         source = self.lidar_frame
-        target = self.camera_frame if self.calibration_type == "LiDAR2Cam" else self.lidar2_frame
+        target = self.camera_frame if self._is_lidar_cam else self.lidar2_frame
         path_frames = self.find_transformation_path_frames(source, target)
         self.tf_graph_window = TFGraphWidget(self.tf_tree, source, target, path_frames, parent=self)
         self.tf_graph_window.show()
@@ -1163,6 +1576,7 @@ class MainWindow(QMainWindow):
                     float(self.ry_input.text()),
                     float(self.rz_input.text()),
                 ],
+                degrees=True,
             )
             self.current_transform = np.eye(4, dtype=np.float64)
             self.current_transform[:3, :3] = rot.as_matrix()
@@ -1181,9 +1595,9 @@ class MainWindow(QMainWindow):
         self.tx_input.setText(f"{trans[0]:.6f}")
         self.ty_input.setText(f"{trans[1]:.6f}")
         self.tz_input.setText(f"{trans[2]:.6f}")
-        self.rx_input.setText(f"{euler[0]:.6f}")
-        self.ry_input.setText(f"{euler[1]:.6f}")
-        self.rz_input.setText(f"{euler[2]:.6f}")
+        self.rx_input.setText(f"{np.degrees(euler[0]):.4f}")
+        self.ry_input.setText(f"{np.degrees(euler[1]):.4f}")
+        self.rz_input.setText(f"{np.degrees(euler[2]):.4f}")
 
     def use_identity_transform(self):
         self.current_transform = np.eye(4, dtype=np.float64)
@@ -1218,10 +1632,10 @@ class MainWindow(QMainWindow):
             return
 
         self.calibrated_transform = calibrated_transform
-        if self.calibration_type == "LiDAR2Cam":
+        if self._is_lidar_cam:
             self.calibrated_transform = np.linalg.inv(calibrated_transform)
-            self.original_source_frame = self.lidar_frame
-            self.original_target_frame = self.camera_frame
+            self.original_source_frame = self._parent_frame
+            self.original_target_frame = self._child_frame
         else:
             self.original_source_frame = self.lidar_frame
             self.original_target_frame = self.lidar2_frame
@@ -1312,12 +1726,54 @@ class MainWindow(QMainWindow):
             print(f"[ERROR] Failed to create or embed TF graph: {e}")
 
     def export_calibration_result(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Target Transform", "", "Text Files (*.txt);;All Files (*)"
+        if self._is_lidar_cam:
+            default_name = f"livox_to_{self._camera_type_label}.yaml"
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Calibration", default_name, "YAML Files (*.yaml)"
+            )
+            if file_path:
+                self._write_calib_yaml(file_path)
+        else:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Target Transform", "", "Text Files (*.txt);;All Files (*)"
+            )
+            if file_path:
+                with open(file_path, "w") as f:
+                    f.write(self.final_transform_display.toPlainText())
+
+    def _write_calib_yaml(self, file_path: str) -> None:
+        from scipy.spatial.transform import Rotation
+
+        T = self.current_final_transform
+        t = T[:3, 3]
+        q = Rotation.from_matrix(T[:3, :3]).as_quat()  # [x, y, z, w]
+
+        parent = self._parent_frame
+        child = self._child_frame
+        key = f"livox_to_{self._camera_type_label}"
+        timestamp = datetime.date.today().isoformat()
+        description = f"LiDAR to {self._camera_type_label.capitalize()} Camera calibration"
+
+        content = (
+            f"{key}:\n"
+            f"  parent_frame: {parent}\n"
+            f"  child_frame: {child}\n"
+            f"  translation:\n"
+            f"    x: {t[0]:.4f}\n"
+            f"    y: {t[1]:.4f}\n"
+            f"    z: {t[2]:.4f}\n"
+            f"  rotation:\n"
+            f"    x: {q[0]:.4f}\n"
+            f"    y: {q[1]:.4f}\n"
+            f"    z: {q[2]:.4f}\n"
+            f"    w: {q[3]:.4f}\n"
+            f"  metadata:\n"
+            f"    source_file: ros2_calib\n"
+            f"    conversion_timestamp: '{timestamp}'\n"
+            f"    description: {description}\n"
         )
-        if file_path:
-            with open(file_path, "w") as f:
-                f.write(self.final_transform_display.toPlainText())
+        with open(file_path, "w") as f:
+            f.write(content)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():

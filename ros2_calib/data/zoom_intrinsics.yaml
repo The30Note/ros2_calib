@@ -1,0 +1,23 @@
+image_width: 3840
+image_height: 2160
+camera_name: zoom_main
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [3444.74785919, 0.0, 1979.56742096, 0.0, 3432.50617218, 1120.81038503, 0.0,
+    0.0, 1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.08718828, 0.1857785, 0.00279353, 0.00258276, -0.3936518]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [3444.74785919, 0.0, 1979.56742096, 0.0, 0.0, 3432.50617218, 1120.81038503,
+    0.0, 0.0, 0.0, 1.0, 0.0]
+rms_reprojection_error_px: 0.7348127859393833
