@@ -47,7 +47,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -60,27 +62,81 @@ from .common import AppConstants, Colors, UIStyles
 from .lidar_cleaner import LiDARCleaner
 
 
-class PointCloudItem(QGraphicsItem):
-    """A QGraphicsItem that efficiently draws a large number of points."""
+class CollapsibleSection(QWidget):
+    """A header button + body widget pair that can be toggled open/closed."""
 
-    def __init__(self, points, colors, point_size, opacity=0.8):
+    def __init__(self, title: str, collapsed: bool = False, parent=None):
+        super().__init__(parent)
+        self._title = title
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._btn = QPushButton()
+        self._btn.setCheckable(True)
+        self._btn.setChecked(not collapsed)
+        self._btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px; font-weight: bold;"
+            " background: #2d2d2d; border: none; color: #ccc; }"
+            " QPushButton:hover { background: #383838; }"
+        )
+        self._btn.toggled.connect(self._on_toggle)
+        root.addWidget(self._btn)
+
+        self.body = QWidget()
+        self._body_layout = QVBoxLayout(self.body)
+        self._body_layout.setContentsMargins(4, 4, 4, 4)
+        self._body_layout.setSpacing(4)
+        root.addWidget(self.body)
+
+        self._on_toggle(not collapsed)
+
+    def _on_toggle(self, expanded: bool):
+        self.body.setVisible(expanded)
+        arrow = "▼" if expanded else "▶"
+        self._btn.setText(f"{arrow}  {self._title}")
+
+    def add_widget(self, w: QWidget):
+        self._body_layout.addWidget(w)
+
+    def add_layout(self, layout):
+        self._body_layout.addLayout(layout)
+
+    def body_layout(self):
+        return self._body_layout
+
+
+_VORONOI_FILL_MAX_DIST = 20   # pixels at full resolution; controls boundary tightness
+_VORONOI_DOWNSAMPLE    = 4    # compute fill at 1/N resolution, then upscale
+
+
+class PointCloudItem(QGraphicsItem):
+    """A QGraphicsItem that draws projected LiDAR points.
+
+    When point_size == 0 the item switches to Voronoi-fill mode: every pixel
+    within _VORONOI_FILL_MAX_DIST of a projected point gets the colour of its
+    nearest neighbour, producing a solid filled map that stays within the
+    actual footprint of the scan without bleeding to image edges.
+    """
+
+    def __init__(self, points, colors, point_size, opacity=0.8, img_size=(0, 0)):
         super().__init__()
         self.points = points
         self.point_size = point_size
         self.opacity = opacity
-        # Pre-convert colors to uint8 RGBA once at construction time
-        colors_arr = np.array(colors)  # (N, 4) float 0-1
+        self.img_h, self.img_w = img_size
+        colors_arr = np.array(colors)
         self._colors_u8 = (colors_arr * 255).clip(0, 255).astype(np.uint8)
         self._pixmap = None
         self._pixmap_origin = None
         self._build_pixmap()
 
-    def update_data(self, points, colors, point_size, opacity):
-        """Update projected points and visual params in-place, avoiding remove/add."""
+    def update_data(self, points, colors, point_size, opacity, img_size=(0, 0)):
         self.prepareGeometryChange()
         self.points = points
         self.point_size = point_size
         self.opacity = opacity
+        self.img_h, self.img_w = img_size
         self._colors_u8 = (np.array(colors) * 255).clip(0, 255).astype(np.uint8)
         self._build_pixmap()
         self.update()
@@ -89,6 +145,13 @@ class PointCloudItem(QGraphicsItem):
         if self.points.shape[0] == 0:
             self._pixmap = None
             return
+        if self.point_size == 0:
+            self._build_voronoi_pixmap()
+        else:
+            self._build_dot_pixmap()
+
+    # ── dot / square rendering (existing behaviour) ─────────────────────
+    def _build_dot_pixmap(self):
         s = max(1, int(self.point_size))
         pad = s // 2
         xs = self.points[:, 0].astype(np.int32)
@@ -100,7 +163,6 @@ class PointCloudItem(QGraphicsItem):
         img = np.zeros((h, w, 4), dtype=np.uint8)
         lxs = np.clip(xs - x0, 0, w - 1)
         lys = np.clip(ys - y0, 0, h - 1)
-
         img[lys, lxs] = self._colors_u8
 
         if s > 1:
@@ -111,24 +173,76 @@ class PointCloudItem(QGraphicsItem):
         self._pixmap = QPixmap.fromImage(qimg)
         self._pixmap_origin = (x0, y0)
 
+    # ── Voronoi nearest-neighbour fill ───────────────────────────────────
+    def _build_voronoi_pixmap(self):
+        if self.img_h == 0 or self.img_w == 0:
+            self._build_dot_pixmap()   # no image dims — fall back
+            return
+
+        sc = _VORONOI_DOWNSAMPLE
+        sh, sw = self.img_h // sc, self.img_w // sc
+
+        # Projected point coords scaled to low-res space
+        pts_lo = self.points / sc          # (N, 2)
+
+        # Low-res pixel grid as (M, 2) query array  [x, y]
+        gx = np.arange(sw, dtype=np.float32) + 0.5
+        gy = np.arange(sh, dtype=np.float32) + 0.5
+        grid_x, grid_y = np.meshgrid(gx, gy)          # each (sh, sw)
+        query = np.column_stack([grid_x.ravel(), grid_y.ravel()])  # (sh*sw, 2)
+
+        tree = KDTree(pts_lo)
+        dists, idxs = tree.query(query, workers=-1)    # use all CPU cores
+
+        # Assign colours; mask pixels too far from any point
+        fill = self._colors_u8[idxs].astype(np.float32)          # (sh*sw, 4)
+        max_dist_lo = _VORONOI_FILL_MAX_DIST / sc
+        fill[dists > max_dist_lo, 3] = 0                          # alpha → 0
+
+        fill_img = fill.reshape(sh, sw, 4).astype(np.uint8)
+
+        # Upscale colour channels with bilinear for smooth gradients;
+        # upscale alpha with nearest to keep a hard boundary (no fringe).
+        rgb_up = cv2.resize(fill_img[:, :, :3], (self.img_w, self.img_h),
+                            interpolation=cv2.INTER_LINEAR)
+        a_up   = cv2.resize(fill_img[:, :,  3], (self.img_w, self.img_h),
+                            interpolation=cv2.INTER_NEAREST)
+        full   = np.dstack([rgb_up, a_up])
+
+        # Opacity is applied at paint time via painter.setOpacity(), not baked here.
+        qimg = QImage(full.tobytes(), self.img_w, self.img_h,
+                      4 * self.img_w, QImage.Format_RGBA8888)
+        self._pixmap = QPixmap.fromImage(qimg)
+        self._pixmap_origin = (0, 0)
+
+    # ── QGraphicsItem interface ──────────────────────────────────────────
     def boundingRect(self):
         if self.points.shape[0] == 0:
             return QRectF()
+        if self.point_size == 0 and self.img_w > 0:
+            return QRectF(0, 0, self.img_w, self.img_h)
         min_coords = np.min(self.points, axis=0)
         max_coords = np.max(self.points, axis=0)
-        pad = self.point_size // 2
+        pad = max(self.point_size // 2, 1)
         return QRectF(
             min_coords[0] - pad,
             min_coords[1] - pad,
-            max_coords[0] - min_coords[0] + self.point_size,
-            max_coords[1] - min_coords[1] + self.point_size,
+            max_coords[0] - min_coords[0] + pad * 2,
+            max_coords[1] - min_coords[1] + pad * 2,
         )
 
     def paint(self, painter: QPainter, option, widget=None):
-        if self._pixmap is not None:
-            painter.setOpacity(self.opacity)
-            painter.drawPixmap(int(self._pixmap_origin[0]), int(self._pixmap_origin[1]), self._pixmap)
-            painter.setOpacity(1.0)
+        if self._pixmap is None:
+            return
+        painter.setOpacity(self.opacity)
+        painter.drawPixmap(int(self._pixmap_origin[0]), int(self._pixmap_origin[1]),
+                           self._pixmap)
+        painter.setOpacity(1.0)
+
+    def update_opacity(self, opacity: float):
+        """Change opacity without rebuilding the pixmap — just triggers a repaint."""
+        self.opacity = opacity
+        self.update()
 
 
 class ZoomableView(QGraphicsView):
@@ -138,19 +252,26 @@ class ZoomableView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self._on_resize_callback = None
 
     def wheelEvent(self, event):
         zoom_in_factor = 1.25
         zoom_out_factor = 1 / zoom_in_factor
-
         if event.angleDelta().y() > 0:
             self.scale(zoom_in_factor, zoom_in_factor)
         else:
             self.scale(zoom_out_factor, zoom_out_factor)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._on_resize_callback:
+            self._on_resize_callback()
+
 
 class CalibrationWidget(QWidget):
-    calibration_completed = Signal(object)  # Signal to emit calibrated transform(s)
+    calibration_completed = Signal(object)   # Signal to emit calibrated transform(s)
+    _refinement_done = Signal(object)        # emitted from worker thread with new extrinsics
+    extrinsics_updated = Signal(np.ndarray)  # T_lidar_cam after refinement/calibration
 
     def __init__(
         self,
@@ -208,28 +329,34 @@ class CalibrationWidget(QWidget):
         self.second_kdtree = None
         self.has_second_pointcloud = second_pointcloud_msg is not None
 
+        self.default_button_style = UIStyles.DEFAULT_BUTTON
+        self._grid_items: list = []
+        self._grid_visible: bool = False
+
         main_layout = QHBoxLayout()
         self.setLayout(main_layout)
 
-        left_layout = QVBoxLayout()
         self.scene = QGraphicsScene()
         self._bg_pixmap_item = None
         self.view = ZoomableView(self.scene)
         self.view.viewport().installEventFilter(self)
-        left_layout.addWidget(self.view)
+        self.view._on_resize_callback = self._reposition_overlay
 
-        right_controls_layout = self._setup_controls()
+        right_scroll = self._setup_controls()
 
-        main_layout.addLayout(left_layout, 4)
-        main_layout.addLayout(right_controls_layout, 1)
+        main_layout.addWidget(self.view, 3)
+        main_layout.addWidget(right_scroll, 1)
+
+        self._setup_overlay_buttons()
+
+        self._refinement_done.connect(self._apply_refinement_result)
+        self._edge_map_cache = None
 
         self.display_image()
         self.project_pointcloud()
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
-        self._update_inputs_from_extrinsics()
         self._update_calibrate_button_highlight()
-        self.display_camera_intrinsics()
 
     def has_significant_distortion(self):
         """Check if camera has significant distortion coefficients."""
@@ -323,246 +450,187 @@ class CalibrationWidget(QWidget):
             print(f"[WARNING] Failed to rectify image: {e}")
             return image
 
-    def _setup_controls(self):
-        right_layout = QHBoxLayout()
-        col1_layout = QVBoxLayout()
+    def _setup_controls(self) -> QScrollArea:
+        """Build the scrollable side panel with collapsible sections."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        # View Controls Section
-        view_group = QGroupBox("View Settings")
-        view_controls_layout = QFormLayout(view_group)
+        container = QWidget()
+        root = QVBoxLayout(container)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(2)
+
+        # ── View Settings ────────────────────────────────────────────────
+        view_sec = CollapsibleSection("View Settings")
+
+        form_w = QWidget()
+        view_form = QFormLayout(form_w)
+        view_form.setContentsMargins(0, 0, 0, 0)
+
         self.image_res_label = QLabel("N/A")
-        view_controls_layout.addRow("Image Resolution:", self.image_res_label)
+        view_form.addRow("Resolution:", self.image_res_label)
+
         self.point_size_spinbox = QSpinBox()
-        self.point_size_spinbox.setRange(1, 10)
+        self.point_size_spinbox.setRange(0, 10)
         self.point_size_spinbox.setValue(AppConstants.DEFAULT_POINT_SIZE)
-        view_controls_layout.addRow("Point Size:", self.point_size_spinbox)
+        self.point_size_spinbox.setSpecialValueText("Fill")  # shown when value == 0
+        view_form.addRow("Point Size:", self.point_size_spinbox)
+
         self.opacity_spinbox = QDoubleSpinBox()
         self.opacity_spinbox.setRange(0.0, 1.0)
         self.opacity_spinbox.setSingleStep(0.05)
         self.opacity_spinbox.setValue(0.8)
-        view_controls_layout.addRow("Point Opacity:", self.opacity_spinbox)
+        view_form.addRow("Opacity:", self.opacity_spinbox)
+
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(
-            [
-                "autumn",
-                "jet",
-                "winter",
-                "summer",
-                "spring",
-                "hot",
-                "magma",
-                "inferno",
-                "Spectral",
-                "RdYlGn",
-            ]
+            ["autumn", "jet", "winter", "summer", "spring", "hot",
+             "magma", "inferno", "Spectral", "RdYlGn"]
         )
         self.colormap_combo.setCurrentText(AppConstants.DEFAULT_COLORMAP)
-        view_controls_layout.addRow("Colormap:", self.colormap_combo)
+        view_form.addRow("Colormap:", self.colormap_combo)
+
         self.colorization_mode_combo = QComboBox()
-        self.colorization_mode_combo.addItems(["Intensity", "Distance", "LiDAR Edge", "Surface Normals"])
-        self.colorization_mode_combo.setCurrentText("Intensity")
-        view_controls_layout.addRow("Color Mode:", self.colorization_mode_combo)
+        self.colorization_mode_combo.addItems(
+            ["Intensity", "Distance", "LiDAR Edge", "Surface Normals"]
+        )
+        view_form.addRow("Color Mode:", self.colorization_mode_combo)
+
         self.min_value_spinbox = QDoubleSpinBox()
         self.min_value_spinbox.setRange(-1e9, 1e9)
         self.min_value_spinbox.setDecimals(2)
-        view_controls_layout.addRow("Min Value:", self.min_value_spinbox)
+        view_form.addRow("Min:", self.min_value_spinbox)
+
         self.max_value_spinbox = QDoubleSpinBox()
         self.max_value_spinbox.setRange(-1e9, 1e9)
         self.max_value_spinbox.setDecimals(2)
-        view_controls_layout.addRow("Max Value:", self.max_value_spinbox)
+        view_form.addRow("Max:", self.max_value_spinbox)
 
-        # Normal colour-frame rotation (only visible in Surface Normals mode)
+        # Surface-normals rotation rows (hidden by default)
         self._normal_rot_labels = []
         self._normal_rot_spinboxes = []
-        for label in ("Roll (°):", "Pitch (°):", "Yaw (°):"):
+        for lbl_text in ("Roll (°):", "Pitch (°):", "Yaw (°):"):
             sb = QDoubleSpinBox()
             sb.setRange(-180.0, 180.0)
             sb.setSingleStep(1.0)
             sb.setDecimals(1)
-            sb.setValue(0.0)
-            lbl = view_controls_layout.labelForField  # placeholder — set below
-            view_controls_layout.addRow(label, sb)
-            # Store the label widget so we can show/hide the row
-            lbl_widget = view_controls_layout.itemAt(
-                view_controls_layout.rowCount() - 1, QFormLayout.LabelRole
+            view_form.addRow(lbl_text, sb)
+            lbl_widget = view_form.itemAt(
+                view_form.rowCount() - 1, QFormLayout.LabelRole
             ).widget()
             self._normal_rot_labels.append(lbl_widget)
             self._normal_rot_spinboxes.append(sb)
         self._set_normal_rotation_visible(False)
 
-        # Image rectification checkbox
-        self.rectify_checkbox = QCheckBox("Rectify Image")
-        self.rectify_checkbox.setToolTip("Undistort the image using camera distortion parameters")
-        # Only enable if distortion coefficients are available
-        has_distortion = self.has_significant_distortion()
-        self.rectify_checkbox.setEnabled(has_distortion)
-        # Enable by default if distortion is detected
-        if has_distortion:
-            self.is_rectification_enabled = True
-            self.rectify_checkbox.setChecked(True)
-        self.rectify_checkbox.toggled.connect(self.toggle_rectification)
-        view_controls_layout.addRow(self.rectify_checkbox)
-
-
-        # Add Clean Occluded Points button here
         self.clean_occlusion_button = QPushButton("Clean Occluded Points")
         self.clean_occlusion_button.clicked.connect(self.run_occlusion_cleaning)
-        view_controls_layout.addRow(self.clean_occlusion_button)
 
-        col1_layout.addWidget(view_group)
-        col1_layout.addSpacing(20)
+        view_sec.add_widget(form_w)
+        view_sec.add_widget(self.clean_occlusion_button)
+        root.addWidget(view_sec)
 
-        # Correspondence Controls Section
-        corr_group = QGroupBox("Correspondence Management")
-        corr_layout = QVBoxLayout(corr_group)
+        # ── Correspondences ──────────────────────────────────────────────
+        corr_sec = CollapsibleSection("Correspondences")
 
-        # Correspondence mode selection
         if self.has_second_pointcloud:
             self.correspondence_mode_combo = QComboBox()
             self.correspondence_mode_combo.addItems(
                 ["Master LiDAR ↔ Camera", "Second LiDAR ↔ Master LiDAR"]
             )
-            corr_layout.addWidget(QLabel("Correspondence Mode:"))
-            corr_layout.addWidget(self.correspondence_mode_combo)
+            corr_sec.add_widget(QLabel("Mode:"))
+            corr_sec.add_widget(self.correspondence_mode_combo)
 
         self.add_corr_button = QPushButton("Add Correspondence")
         self.add_corr_button.setCheckable(True)
         self.add_corr_button.toggled.connect(self.toggle_selection_mode)
-        corr_layout.addWidget(self.add_corr_button)
+        corr_sec.add_widget(self.add_corr_button)
+
         self.confirm_3d_button = QPushButton("Confirm 3D Selection")
         self.confirm_3d_button.setVisible(False)
         self.confirm_3d_button.clicked.connect(self.finalize_correspondence)
-        corr_layout.addWidget(self.confirm_3d_button)
+        corr_sec.add_widget(self.confirm_3d_button)
+
         self.corr_list_widget = QListWidget()
         self.corr_list_widget.currentItemChanged.connect(self.highlight_from_list)
-        corr_layout.addWidget(self.corr_list_widget)
+        corr_sec.add_widget(self.corr_list_widget)
+
         self.delete_corr_button = QPushButton("Delete Selected")
         self.delete_corr_button.clicked.connect(self.delete_correspondence)
-        corr_layout.addWidget(self.delete_corr_button)
-        col1_layout.addWidget(corr_group)
-        col1_layout.addSpacing(20)
+        corr_sec.add_widget(self.delete_corr_button)
 
-        # Calibration Controls Section
-        calib_group = QGroupBox("Calibration Settings")
-        calib_controls_layout = QFormLayout(calib_group)
+        root.addWidget(corr_sec)
+
+        # ── Calibration ──────────────────────────────────────────────────
+        calib_sec = CollapsibleSection("Calibration")
+
+        calib_form_w = QWidget()
+        calib_form = QFormLayout(calib_form_w)
+        calib_form.setContentsMargins(0, 0, 0, 0)
+
         self.pnp_solver_combo = QComboBox()
         self.pnp_solver_combo.addItems(["Iterative", "SQPnP", "None"])
-        calib_controls_layout.addRow("RANSAC:", self.pnp_solver_combo)
+        calib_form.addRow("RANSAC:", self.pnp_solver_combo)
+
         self.lsq_method_combo = QComboBox()
         self.lsq_method_combo.addItems(["lm", "trf", "dogbox"])
-        calib_controls_layout.addRow("LSQ Method:", self.lsq_method_combo)
-        col1_layout.addWidget(calib_group)
+        calib_form.addRow("LSQ Method:", self.lsq_method_combo)
 
-        # Calibration Execution Section
-        exec_group = QGroupBox("Calibration Execution")
-        exec_layout = QVBoxLayout(exec_group)
         self.calibrate_button = QPushButton("Calibrate")
         self.calibrate_button.clicked.connect(self.run_calibration)
-        exec_layout.addWidget(self.calibrate_button)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
-        exec_layout.addWidget(self.progress_bar)
+
         self.reset_button = QPushButton("Reset All")
         self.reset_button.clicked.connect(self.reset_calibration_state)
-        exec_layout.addWidget(self.reset_button)
+
         self.results_label = QLabel("Results:")
         self.results_label.setWordWrap(True)
-        exec_layout.addWidget(self.results_label)
-        col1_layout.addWidget(exec_group)
-        col1_layout.addStretch()
 
-        # Manual Fine-Tuning Section
-        tuning_group = QGroupBox("Manual Fine-Tuning")
-        col2_layout = QVBoxLayout()
-        tuning_layout = QGridLayout(tuning_group)
-        self.t_step_spinbox = QDoubleSpinBox()
-        self.t_step_spinbox.setRange(0.01, 5.0)
-        self.t_step_spinbox.setValue(AppConstants.DEFAULT_TRANSLATION_STEP)
-        self.t_step_spinbox.setSingleStep(0.1)
-        self.t_step_spinbox.setSuffix(" cm")
-        self.t_step_spinbox.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self.t_step_spinbox.valueChanged.connect(self._on_step_size_changed)
-        self.euler_convention_combo = QComboBox()
-        self.euler_convention_combo.addItems(self.euler_convention_options)
-        self.euler_convention_combo.setCurrentText(self.euler_convention)
-        self.euler_convention_combo.currentTextChanged.connect(self.on_euler_convention_changed)
+        calib_sec.add_widget(calib_form_w)
+        calib_sec.add_widget(self.calibrate_button)
+        calib_sec.add_widget(self.progress_bar)
+        calib_sec.add_widget(self.reset_button)
+        calib_sec.add_widget(self.results_label)
+        root.addWidget(calib_sec)
 
-        tuning_layout.addWidget(QLabel("Pos Step:"), 0, 0, 1, 2)
-        tuning_layout.addWidget(self.t_step_spinbox, 0, 2, 1, 1)
-        self.r_step_spinbox = QDoubleSpinBox()
-        self.r_step_spinbox.setRange(0.01, 10.0)
-        self.r_step_spinbox.setValue(AppConstants.DEFAULT_ROTATION_STEP)
-        self.r_step_spinbox.setSingleStep(0.05)
-        self.r_step_spinbox.setSuffix(" °")
-        self.r_step_spinbox.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self.r_step_spinbox.valueChanged.connect(self._on_step_size_changed)
-        tuning_layout.addWidget(QLabel("Rot Step:"), 1, 0, 1, 2)
-        tuning_layout.addWidget(self.r_step_spinbox, 1, 2, 1, 1)
-        self.step_size_ok_button = QPushButton("OK")
-        self.step_size_ok_button.clicked.connect(self._on_step_size_confirmed)
-        tuning_layout.addWidget(self.step_size_ok_button, 0, 3, 2, 1)
-        self.dof_widgets = {}
-        for i, label in enumerate(["x", "y", "z", "roll", "pitch", "yaw"]):
-            spinbox = QDoubleSpinBox()
-            spinbox.setRange(-1e6, 1e6)
-            spinbox.setDecimals(4)
-            spinbox.setButtonSymbols(QDoubleSpinBox.NoButtons)
-            spinbox.valueChanged.connect(self._update_extrinsics_from_inputs)
-            minus_button = QPushButton("-")
-            plus_button = QPushButton("+")
-            minus_button.clicked.connect(partial(self._adjust_dof, label, -1))
-            plus_button.clicked.connect(partial(self._adjust_dof, label, 1))
-            tuning_layout.addWidget(QLabel(label.capitalize() + ":"), i + 2, 0)
-            tuning_layout.addWidget(spinbox, i + 2, 1, 1, 2)
-            tuning_layout.addWidget(minus_button, i + 2, 3)
-            tuning_layout.addWidget(plus_button, i + 2, 4)
-            self.dof_widgets[label] = spinbox
+        # ── Auto Refinement ──────────────────────────────────────────────
+        refine_sec = CollapsibleSection("Auto Refinement")
 
-        # Place Euler convention selector after the manual rotation inputs
-        euler_row = 8
-        tuning_layout.addWidget(QLabel("Euler Angle Convention:"), euler_row, 0, 1, 2)
-        tuning_layout.addWidget(self.euler_convention_combo, euler_row, 2, 1, 3)
-        col2_layout.addWidget(tuning_group)
-        col2_layout.addSpacing(20)
+        self.auto_refine_button = QPushButton("Auto Refine (Edge Alignment)")
+        self.auto_refine_button.setToolTip(
+            "Optimise 6-DOF transform by aligning LiDAR depth edges with image edges.\n"
+            "Requires a good initial guess (within ~5° / 5 cm)."
+        )
+        self.auto_refine_button.clicked.connect(self.run_auto_refinement)
 
-        # Camera Intrinsics Section
-        intrinsics_group = QGroupBox("Camera Intrinsics")
-        intrinsics_layout = QVBoxLayout(intrinsics_group)
+        self.refine_status_label = QLabel("Ready")
+        self.refine_status_label.setStyleSheet("color: #888; font-size: 11px;")
 
-        self.intrinsics_display = QTextEdit()
-        self.intrinsics_display.setMinimumHeight(400)
-        self.intrinsics_display.setMaximumHeight(600)
-        self.intrinsics_display.setFont("monospace")
-        self.intrinsics_display.setFontPointSize(10)
-        self.intrinsics_display.setReadOnly(True)
-        intrinsics_layout.addWidget(self.intrinsics_display)
+        refine_sec.add_widget(self.auto_refine_button)
+        refine_sec.add_widget(self.refine_status_label)
+        root.addWidget(refine_sec)
 
-        col2_layout.addWidget(intrinsics_group)
-        col2_layout.addSpacing(20)
-
-        # Export Section
-        export_group = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_group)
         self.export_button = QPushButton("Export Calibration")
-        self.export_button.clicked.connect(self.view_calibration_results)
-        export_layout.addWidget(self.export_button)
-        col2_layout.addWidget(export_group)
-        col2_layout.addStretch()
+        self.export_button.clicked.connect(self.export_calibration)
+        root.addWidget(self.export_button)
 
-        right_layout.addLayout(col1_layout, 100)
-        right_layout.addLayout(col2_layout, 40)
+        root.addStretch()
+        scroll.setWidget(container)
 
-        self.default_button_style = UIStyles.DEFAULT_BUTTON
+        # Signal connections
         self.point_size_spinbox.valueChanged.connect(self._on_view_params_changed)
-        self.opacity_spinbox.valueChanged.connect(self._on_view_params_changed)
+        self.opacity_spinbox.valueChanged.connect(self._on_opacity_changed)
         self.colormap_combo.currentTextChanged.connect(self._on_view_params_changed)
         self.colorization_mode_combo.currentTextChanged.connect(self._on_colorization_mode_changed)
         for sb in self._normal_rot_spinboxes:
             sb.valueChanged.connect(self._on_view_params_changed)
         self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.max_value_spinbox.valueChanged.connect(self._on_view_params_changed)
-        return right_layout
+
+        return scroll
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -607,6 +675,13 @@ class CalibrationWidget(QWidget):
         for lbl, sb in zip(self._normal_rot_labels, self._normal_rot_spinboxes):
             lbl.setVisible(visible)
             sb.setVisible(visible)
+
+    def _on_opacity_changed(self, value: float):
+        """Opacity only needs a repaint — no rebuild."""
+        if self.point_cloud_item is not None:
+            self.point_cloud_item.update_opacity(value)
+        if self.second_point_cloud_item is not None:
+            self.second_point_cloud_item.update_opacity(value)
 
     def _on_view_params_changed(self):
         self.redraw_points()
@@ -686,16 +761,186 @@ class CalibrationWidget(QWidget):
         _, eigvecs = np.linalg.eigh(cov)                         # (N, 3, 3)
         return eigvecs[:, :, 0]                                  # (N, 3) smallest eigenvector
 
-    def _on_step_size_changed(self):
-        self.step_size_ok_button.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
+    # ------------------------------------------------------------------ #
+    #  Auto refinement                                                     #
+    # ------------------------------------------------------------------ #
 
-    def _on_step_size_confirmed(self):
-        self.step_size_ok_button.setStyleSheet(self.default_button_style)
+    def run_auto_refinement(self):
+        if not hasattr(self, "points_xyz") or self.points_xyz.shape[0] == 0:
+            self.refine_status_label.setText("No point cloud loaded.")
+            return
+        if not hasattr(self, "valid_indices") or len(self.valid_indices) == 0:
+            self.refine_status_label.setText("No projected points — check extrinsics.")
+            return
 
-    def on_euler_convention_changed(self, convention: str):
-        """Update UI spinboxes when a new Euler convention is selected."""
-        self.euler_convention = convention
-        self._update_inputs_from_extrinsics()
+        self.auto_refine_button.setEnabled(False)
+        self.refine_status_label.setText("Running…")
+        self._edge_map_cache = None  # invalidate cache when user triggers a new run
+
+        import threading
+        threading.Thread(target=self._refinement_worker, daemon=True).start()
+
+    def _refinement_worker(self):
+        try:
+            new_extrinsics, status = self._run_edge_alignment()
+            self._refinement_done.emit((new_extrinsics, status))
+        except Exception as e:
+            self._refinement_done.emit((None, f"Error: {e}"))
+
+    def _apply_refinement_result(self, payload):
+        new_extrinsics, status = payload
+        self.auto_refine_button.setEnabled(True)
+        self.refine_status_label.setText(status)
+        if new_extrinsics is not None:
+            self.extrinsics = new_extrinsics
+            self.extrinsics_updated.emit(np.linalg.inv(self.extrinsics))
+            self.redraw_points()
+            self._highlight_export_button()
+
+    def _compute_edge_map(self) -> np.ndarray:
+        """Canny edges on the current image, Gaussian-blurred for a smooth cost landscape."""
+        if self._edge_map_cache is not None:
+            return self._edge_map_cache
+
+        img = self.original_cv_image
+        if img is None:
+            h, w = self.camerainfo_msg.height, self.camerainfo_msg.width
+            return np.zeros((h, w), dtype=np.float32)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        if self.is_rectification_enabled:
+            K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+            D = np.array(self.camerainfo_msg.d)
+            try:
+                if self._is_fisheye:
+                    gray = cv2.fisheye.undistortImage(gray, K, D[:4].reshape(4, 1), None, K)
+                else:
+                    gray = cv2.undistort(gray, K, D)
+            except Exception:
+                pass
+
+        edges = cv2.Canny(gray, 30, 100)
+        edge_map = cv2.GaussianBlur(edges.astype(np.float32), (0, 0), sigmaX=4.0)
+        max_val = edge_map.max()
+        if max_val > 0:
+            edge_map /= max_val
+        self._edge_map_cache = edge_map
+        return edge_map
+
+    @staticmethod
+    def _bilinear_sample(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
+        """Bilinear interpolation of img at float (x, y) locations."""
+        x = np.clip(pts[:, 0], 0, img.shape[1] - 2)
+        y = np.clip(pts[:, 1], 0, img.shape[0] - 2)
+        x0, y0 = x.astype(np.int32), y.astype(np.int32)
+        dx, dy = x - x0, y - y0
+        return (
+            img[y0,     x0    ] * (1 - dx) * (1 - dy)
+            + img[y0,     x0 + 1] * dx       * (1 - dy)
+            + img[y0 + 1, x0    ] * (1 - dx) * dy
+            + img[y0 + 1, x0 + 1] * dx       * dy
+        )
+
+    def _run_edge_alignment(self):
+        from scipy.optimize import minimize
+
+        K = np.array(self.camerainfo_msg.k, dtype=np.float64).reshape(3, 3)
+        D = np.array(self.camerainfo_msg.d, dtype=np.float64)
+        is_fisheye = self._is_fisheye
+        is_rectified = self.is_rectification_enabled
+
+        # When rectification is active the edge map is in undistorted pixel space,
+        # so projection inside the objective must also produce undistorted coords.
+        # The simplest way is to project with zero distortion (equivalent to
+        # projecting onto the rectified image plane with the same K).
+        D_proj = np.zeros_like(D) if is_rectified else D
+        d4_proj = D_proj[:4].reshape(4, 1)
+
+        edge_map = self._compute_edge_map()
+        h, w = edge_map.shape
+
+        # Select top LiDAR edge points visible in current projection
+        valid_pts_3d = self.points_xyz[self.valid_indices]
+        pts_cam = (self.extrinsics[:3, :3] @ valid_pts_3d.T).T + self.extrinsics[:3, 3]
+        edge_scores = self._compute_lidar_edge_scores(pts_cam, self.points_proj_valid)
+
+        n_pts = min(6000, len(self.valid_indices))
+        top_idx = np.argsort(edge_scores)[-n_pts:]
+        edge_pts_3d = valid_pts_3d[top_idx].astype(np.float64)
+
+        # Initial params: T_lidar→camera [tx, ty, tz, rx, ry, rz] in radians
+        T_lc0 = np.linalg.inv(self.extrinsics)
+        t0 = T_lc0[:3, 3].copy()
+        r0 = Rotation.from_matrix(T_lc0[:3, :3]).as_euler("xyz")
+        x0 = np.concatenate([t0, r0])
+
+        # Bounds: ±5 cm translation, ±3° rotation around initial guess
+        # Rotation tighter than translation — small angle errors cause large pixel shifts
+        dr = np.radians(3)
+        bounds = (
+            [(t - 0.05, t + 0.05) for t in t0]
+            + [(r - dr, r + dr) for r in r0]
+        )
+
+        n_edge = len(edge_pts_3d)
+
+        def objective(params):
+            tx, ty, tz, rx, ry, rz = params
+            R = Rotation.from_euler("xyz", [rx, ry, rz]).as_matrix()
+            R_cl = R.T
+            t_cl = -(R.T @ np.array([tx, ty, tz]))
+            rvec = cv2.Rodrigues(R_cl.astype(np.float64))[0].ravel()
+            try:
+                if is_fisheye:
+                    pts2d, _ = cv2.fisheye.projectPoints(
+                        edge_pts_3d.reshape(-1, 1, 3),
+                        rvec, t_cl, K, d4_proj,
+                    )
+                else:
+                    pts2d, _ = cv2.projectPoints(
+                        edge_pts_3d, rvec, t_cl, K, D_proj
+                    )
+            except Exception:
+                return 1.0
+
+            pts2d = pts2d.reshape(-1, 2)
+            in_bounds = (
+                (pts2d[:, 0] >= 0) & (pts2d[:, 0] < w - 1)
+                & (pts2d[:, 1] >= 0) & (pts2d[:, 1] < h - 1)
+            )
+            # Always divide by n_edge so off-screen points score 0.
+            # Using a shrinking denominator was rewarding transforms that pushed
+            # points off-screen when the surviving subset had high edge scores.
+            all_scores = np.zeros(n_edge)
+            if in_bounds.sum() > 0:
+                all_scores[in_bounds] = self._bilinear_sample(
+                    edge_map, pts2d[in_bounds]
+                )
+            return -float(all_scores.mean())
+
+        score_before = -objective(x0)
+
+        result = minimize(
+            objective, x0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 150, "ftol": 1e-9, "gtol": 1e-6},
+        )
+
+        tx, ty, tz, rx, ry, rz = result.x
+        R_opt = Rotation.from_euler("xyz", [rx, ry, rz]).as_matrix()
+        T_lc_opt = np.eye(4)
+        T_lc_opt[:3, :3] = R_opt
+        T_lc_opt[:3, 3] = [tx, ty, tz]
+        new_extrinsics = np.linalg.inv(T_lc_opt)
+
+        score_after = -result.fun   # result.fun is already the final objective value
+        status = (
+            f"Done — edge score {score_before:.4f} → {score_after:.4f}"
+            + (" ✓" if score_after > score_before else " (no improvement)")
+        )
+        return new_extrinsics, status
 
     def _update_calibrate_button_highlight(self):
         # Need at least 4 master LiDAR to camera correspondences for calibration
@@ -727,50 +972,6 @@ class CalibrationWidget(QWidget):
         else:
             self.confirm_3d_button.setStyleSheet(self.default_button_style)
             self.confirm_3d_button.setText("Confirm 3D Selection")
-
-    def _adjust_dof(self, dof, direction):
-        spinbox = self.dof_widgets[dof]
-        step = self.t_step_spinbox.value() / 100.0 if dof in "xyz" else self.r_step_spinbox.value()
-        spinbox.setValue(spinbox.value() + direction * step)
-
-    def _update_extrinsics_from_inputs(self):
-        x, y, z = (
-            self.dof_widgets["x"].value(),
-            self.dof_widgets["y"].value(),
-            self.dof_widgets["z"].value(),
-        )
-        roll, pitch, yaw = (
-            self.dof_widgets["roll"].value(),
-            self.dof_widgets["pitch"].value(),
-            self.dof_widgets["yaw"].value(),
-        )
-        # Inputs represent T_lidar→camera; extrinsics = inv(T_lidar→camera)
-        T_lidar_cam = np.identity(4)
-        T_lidar_cam[:3, 3] = [x, y, z]
-        T_lidar_cam[:3, :3] = Rotation.from_euler(
-            self.euler_convention, [roll, pitch, yaw], degrees=True
-        ).as_matrix()
-        self.extrinsics = np.linalg.inv(T_lidar_cam)
-        self.redraw_points()
-        self.update_results_display()
-        self._highlight_export_button()
-
-        # Update the results display to reflect manual changes
-        self.results_label.setText("Results updated via manual adjustment")
-
-    def _update_inputs_from_extrinsics(self):
-        # Display T_lidar→camera (inverse of extrinsics) so direction matches initial guess view
-        T_lidar_cam = np.linalg.inv(self.extrinsics)
-        tvec = T_lidar_cam[:3, 3]
-        rpy = Rotation.from_matrix(T_lidar_cam[:3, :3]).as_euler(
-            self.euler_convention, degrees=True
-        )
-        self.dof_widgets["x"].setValue(tvec[0])
-        self.dof_widgets["y"].setValue(tvec[1])
-        self.dof_widgets["z"].setValue(tvec[2])
-        self.dof_widgets["roll"].setValue(rpy[0])
-        self.dof_widgets["pitch"].setValue(rpy[1])
-        self.dof_widgets["yaw"].setValue(rpy[2])
 
     def toggle_selection_mode(self, checked):
         if checked:
@@ -946,7 +1147,7 @@ class CalibrationWidget(QWidget):
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
         self.update_results_display()
-        self._update_inputs_from_extrinsics()
+        self.extrinsics_updated.emit(np.linalg.inv(self.extrinsics))
         self.clear_all_highlighting()
         self.reset_selection_mode()
         self._update_calibrate_button_highlight()
@@ -1025,53 +1226,18 @@ class CalibrationWidget(QWidget):
 
         # Re-project point cloud with the updated image
         self.project_pointcloud()
+        self._apply_lidar_visibility()
 
-    def display_camera_intrinsics(self):
-        """Display the camera intrinsic matrix K."""
-        # Add camera info
-        display_text = f"Image Size: {self.camerainfo_msg.width} x {self.camerainfo_msg.height}\n"
-
-        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
-
-        display_text += "\nCamera Matrix K:\n"
-        for i in range(3):
-            row_text = "  ".join(f"{K[i, j]:8.2f}" for j in range(3))
-            display_text += f"[{row_text}]\n"
-
-        # Add focal length and principal point info
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-        display_text += f"\nFocal Length: fx={fx:.1f}, fy={fy:.1f}"
-        display_text += f"\nPrincipal Point: cx={cx:.1f}, cy={cy:.1f}"
-
-        display_text += "\n\n"
-
-        display_text += f"Distortion Model: {self.camerainfo_msg.distortion_model}"
-
-        # Add distortion coefficients
-        if hasattr(self.camerainfo_msg, "d") and len(self.camerainfo_msg.d) > 0:
-            dist_coeffs = np.array(self.camerainfo_msg.d)
-            display_text += "\n\nDistortion Coeffs: ["
-            coeffs_str = ", ".join(f"{coeff:.6f}" for coeff in dist_coeffs)
-            display_text += coeffs_str + "]"
-
-            # Add interpretation of common distortion models
-            if len(dist_coeffs) >= 4:
-                display_text += f"\nk1={dist_coeffs[0]:.6f}, k2={dist_coeffs[1]:.6f}"
-                display_text += f"\np1={dist_coeffs[2]:.6f}, p2={dist_coeffs[3]:.6f}"
-                if len(dist_coeffs) >= 5:
-                    display_text += f", k3={dist_coeffs[4]:.6f}"
-                if len(dist_coeffs) >= 8:
-                    display_text += f"\nk4={dist_coeffs[5]:.6f}, k5={dist_coeffs[6]:.6f}, k6={dist_coeffs[7]:.6f}"
-        else:
-            display_text += "\nDistortion Coeffs: None"
-
-        self.intrinsics_display.setPlainText(display_text)
+        # Refresh grid overlay if active (distortion state may have changed)
+        if self._grid_visible:
+            self._clear_intrinsics_grid()
+            self._draw_intrinsics_grid()
 
     def redraw_points(self):
         self.project_pointcloud(self.extrinsics, re_read_cloud=False)
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
+        self._apply_lidar_visibility()
 
     def project_pointcloud(self, extrinsics=None, re_read_cloud=True):
         if extrinsics is not None:
@@ -1175,15 +1341,18 @@ class CalibrationWidget(QWidget):
             colors = cmap(norm_values)
 
         colors[:, 3] = 0.8
+        img_size = (self.camerainfo_msg.height, self.camerainfo_msg.width)
+        pt_sz = self.point_size_spinbox.value()
+        opacity = self.opacity_spinbox.value()
+
         if self.point_cloud_item is not None and self.point_cloud_item.scene():
             self.point_cloud_item.update_data(
-                self.points_proj_valid, colors,
-                self.point_size_spinbox.value(), self.opacity_spinbox.value()
+                self.points_proj_valid, colors, pt_sz, opacity, img_size=img_size
             )
         else:
             self.point_cloud_item = PointCloudItem(
-                self.points_proj_valid, colors, self.point_size_spinbox.value(),
-                opacity=self.opacity_spinbox.value()
+                self.points_proj_valid, colors, pt_sz,
+                opacity=opacity, img_size=img_size
             )
             self.scene.addItem(self.point_cloud_item)
 
@@ -1460,7 +1629,7 @@ class CalibrationWidget(QWidget):
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
         self.update_results_display()
-        self._update_inputs_from_extrinsics()
+        self.extrinsics_updated.emit(np.linalg.inv(self.extrinsics))
         self._highlight_export_button()
 
     def update_results_display(self):
@@ -1483,19 +1652,192 @@ class CalibrationWidget(QWidget):
 
     def view_calibration_results(self):
         """Emit signal to view calibration results in main window."""
-        # Reset export button highlighting when clicked
         self.export_button.setStyleSheet(self.default_button_style)
 
-        # Emit calibration results
         if self.has_second_pointcloud:
-            # Dual LiDAR mode: emit both transforms
             calibration_results = {
                 "mode": "dual_lidar",
                 "master_to_camera": self.extrinsics,
                 "master_to_second_lidar": self.second_lidar_transform,
             }
         else:
-            # Single LiDAR mode: emit single transform
             calibration_results = {"mode": "single_lidar", "master_to_camera": self.extrinsics}
 
         self.calibration_completed.emit(calibration_results)
+
+    # ------------------------------------------------------------------ #
+    #  Public update API (called by MainWindow)                           #
+    # ------------------------------------------------------------------ #
+
+    def update_extrinsics(self, T_lidar_cam: np.ndarray):
+        """Update the displayed transform from the extrinsics panel."""
+        self.extrinsics = np.linalg.inv(T_lidar_cam)
+        self._edge_map_cache = None
+        self.project_pointcloud(re_read_cloud=False)
+        self._apply_lidar_visibility()
+        if self._grid_visible:
+            self._clear_intrinsics_grid()
+            self._draw_intrinsics_grid()
+
+    def update_intrinsics(self, camerainfo_msg):
+        """Update camera intrinsics (called when intrinsics panel changes)."""
+        self.camerainfo_msg = camerainfo_msg
+        self._is_fisheye = getattr(camerainfo_msg, "distortion_model", "").lower() in (
+            "fisheye", "kannala_brandt", "equidistant"
+        )
+        has_distortion = self.has_significant_distortion()
+        self.btn_rectify.setEnabled(has_distortion)
+        self._edge_map_cache = None
+        self.display_image()
+
+    # ------------------------------------------------------------------ #
+    #  Overlay buttons                                                     #
+    # ------------------------------------------------------------------ #
+
+    _OVERLAY_STYLE = (
+        "QPushButton { background: rgba(50,50,50,210); border-radius: 4px;"
+        " color: #ddd; font-weight: bold; font-size: 12px; border: 1px solid #555; }"
+        " QPushButton:checked { background: rgba(214,72,20,220); color: white; border-color: #e96030; }"
+        " QPushButton:hover { background: rgba(80,80,80,220); }"
+        " QPushButton:checked:hover { background: rgba(240,100,40,230); }"
+    )
+
+    def _setup_overlay_buttons(self):
+        self._overlay = QWidget(self.view)
+        ol = QVBoxLayout(self._overlay)
+        ol.setContentsMargins(4, 4, 4, 4)
+        ol.setSpacing(4)
+
+        self.btn_rectify = QPushButton("R")
+        self.btn_rectify.setCheckable(True)
+        self.btn_rectify.setFixedSize(32, 32)
+        self.btn_rectify.setToolTip("Rectify Image")
+        self.btn_rectify.setStyleSheet(self._OVERLAY_STYLE)
+
+        self.btn_show_lidar = QPushButton("L")
+        self.btn_show_lidar.setCheckable(True)
+        self.btn_show_lidar.setChecked(True)
+        self.btn_show_lidar.setFixedSize(32, 32)
+        self.btn_show_lidar.setToolTip("Show LiDAR Points")
+        self.btn_show_lidar.setStyleSheet(self._OVERLAY_STYLE)
+
+        self.btn_show_grid = QPushButton("G")
+        self.btn_show_grid.setCheckable(True)
+        self.btn_show_grid.setFixedSize(32, 32)
+        self.btn_show_grid.setToolTip("Show Intrinsics Grid")
+        self.btn_show_grid.setStyleSheet(self._OVERLAY_STYLE)
+
+        ol.addWidget(self.btn_rectify)
+        ol.addWidget(self.btn_show_lidar)
+        ol.addWidget(self.btn_show_grid)
+        self._overlay.adjustSize()
+        self._overlay.raise_()
+
+        # Set initial rectification state
+        has_distortion = self.has_significant_distortion()
+        self.btn_rectify.setEnabled(has_distortion)
+        if has_distortion:
+            self.is_rectification_enabled = True
+            self.btn_rectify.blockSignals(True)
+            self.btn_rectify.setChecked(True)
+            self.btn_rectify.blockSignals(False)
+
+        self.btn_rectify.toggled.connect(self.toggle_rectification)
+        self.btn_show_lidar.toggled.connect(self._on_lidar_toggle)
+        self.btn_show_grid.toggled.connect(self._on_grid_toggle)
+
+        self._reposition_overlay()
+
+    def _reposition_overlay(self):
+        if not hasattr(self, "_overlay"):
+            return
+        hint = self._overlay.sizeHint()
+        self._overlay.setGeometry(
+            self.view.width() - hint.width() - 8, 8, hint.width(), hint.height()
+        )
+        self._overlay.raise_()
+
+    def _apply_lidar_visibility(self):
+        """Sync point cloud item visibility with the L overlay button state."""
+        if not hasattr(self, "btn_show_lidar"):
+            return
+        visible = self.btn_show_lidar.isChecked()
+        if self.point_cloud_item:
+            self.point_cloud_item.setVisible(visible)
+        if self.second_point_cloud_item:
+            self.second_point_cloud_item.setVisible(visible)
+
+    def _on_lidar_toggle(self, checked: bool):
+        if self.point_cloud_item:
+            self.point_cloud_item.setVisible(checked)
+        if self.second_point_cloud_item:
+            self.second_point_cloud_item.setVisible(checked)
+
+    # ------------------------------------------------------------------ #
+    #  Intrinsics grid overlay                                             #
+    # ------------------------------------------------------------------ #
+
+    def _on_grid_toggle(self, checked: bool):
+        self._grid_visible = checked
+        if checked:
+            self._draw_intrinsics_grid()
+        else:
+            self._clear_intrinsics_grid()
+
+    def _draw_intrinsics_grid(self):
+        """Draw a 9×9 projected grid at 1 m depth as QGraphicsLine items."""
+        if not hasattr(self, "camerainfo_msg"):
+            return
+        K = np.array(self.camerainfo_msg.k, dtype=np.float64).reshape(3, 3)
+        D = np.array(self.camerainfo_msg.d, dtype=np.float64)
+        is_fisheye = self._is_fisheye
+        rectified = self.is_rectification_enabled
+
+        h, w = self.camerainfo_msg.height, self.camerainfo_msg.width
+        n_lines, n_pts, depth = 9, 40, 1.0
+        fx, fy = K[0, 0], K[1, 1]
+        x_half = (w / 2) / fx * 1.05
+        y_half = (h / 2) / fy * 1.05
+
+        xs = np.linspace(-x_half, x_half, n_lines)
+        ys = np.linspace(-y_half, y_half, n_lines)
+        along_x = np.linspace(-x_half, x_half, n_pts)
+        along_y = np.linspace(-y_half, y_half, n_pts)
+        D_use = np.zeros_like(D) if rectified else D
+        rvec = tvec = np.zeros(3)
+
+        pen = QPen(QColor(0, 220, 0), 1)
+
+        def project(pts_3d):
+            pts = pts_3d.reshape(-1, 1, 3).astype(np.float64)
+            try:
+                if is_fisheye and not rectified:
+                    d4 = D_use[:4].reshape(4, 1)
+                    proj, _ = cv2.fisheye.projectPoints(pts, rvec, tvec, K, d4)
+                else:
+                    proj, _ = cv2.projectPoints(pts, rvec, tvec, K, D_use)
+                return proj.reshape(-1, 2)
+            except Exception:
+                return np.empty((0, 2))
+
+        def draw_poly(pts2d):
+            for i in range(len(pts2d) - 1):
+                x1, y1 = pts2d[i]
+                x2, y2 = pts2d[i + 1]
+                if max(abs(x1), abs(x2)) < w * 3 and max(abs(y1), abs(y2)) < h * 3:
+                    item = self.scene.addLine(x1, y1, x2, y2, pen)
+                    item.setZValue(0.5)
+                    self._grid_items.append(item)
+
+        for y_val in ys:
+            pts = np.column_stack([along_x, np.full(n_pts, y_val), np.full(n_pts, depth)])
+            draw_poly(project(pts))
+        for x_val in xs:
+            pts = np.column_stack([np.full(n_pts, x_val), along_y, np.full(n_pts, depth)])
+            draw_poly(project(pts))
+
+    def _clear_intrinsics_grid(self):
+        for item in self._grid_items:
+            if item.scene():
+                self.scene.removeItem(item)
+        self._grid_items = []

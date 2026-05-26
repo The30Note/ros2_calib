@@ -1,0 +1,12 @@
+livox_to_zoom:
+  parent_frame: livox_frame
+  child_frame: zoom_camera_frame
+  translation:
+    x: 0.0000000
+    y: 0.0000000
+    z: 0.0000000
+  rotation:
+    x: 0.0000000
+    y: 0.0000000
+    z: 0.0000000
+    w: 1.0000000
