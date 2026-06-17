@@ -35,21 +35,61 @@ def objective_function(params, points_3d, points_2d, K):
     return error
 
 
+def _log_pnp_diagnostics(points_3d, points_2d, K):
+    """Print a non-RANSAC PnP fit and per-point reprojection error to explain failures."""
+    try:
+        ok, rvec, tvec = cv2.solvePnP(points_3d, points_2d, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+    except cv2.error as e:
+        print(f"  [diag] plain solvePnP also errored: {e}")
+        return
+    if not ok:
+        print("  [diag] plain solvePnP (no RANSAC) also failed — check correspondences/K.")
+        return
+    proj, _ = cv2.projectPoints(points_3d, rvec, tvec, K, None)
+    proj = proj.reshape(-1, 2)
+    errs = np.linalg.norm(proj - points_2d, axis=1)
+    print("  [diag] plain solvePnP succeeded; per-point reprojection error (px):")
+    for i, (e, p2d, pp) in enumerate(zip(errs, points_2d, proj)):
+        print(f"    pt{i}: err={e:7.2f}  clicked={p2d}  reproj={pp}")
+    print(f"  [diag] mean={errs.mean():.2f}px max={errs.max():.2f}px "
+          f"(RANSAC inlier threshold is 8.0px). Points above threshold are rejected; "
+          f"if most exceed it RANSAC reports failure.")
+    z = points_3d[:, 2]
+    print(f"  [diag] 3D point Z (depth) range: min={z.min():.3f} max={z.max():.3f}; "
+          f"any negative/zero Z means points are behind/at the camera origin.")
+
+
 def calibrate(
     correspondences, K, pnp_method=cv2.SOLVEPNP_ITERATIVE, lsq_method="lm", lsq_verbose=2
 ):
     print("---" + "-" * 10 + " Starting Calibration " + "-" * 10 + "---")
     if len(correspondences) < 4:
         print("Error: Need at least 4 correspondences for calibration.")
-        return np.identity(4)
+        return None
 
     points_3d = np.array([c[1] for c in correspondences], dtype=np.float32)
     points_2d = np.array([c[0] for c in correspondences], dtype=np.float32)
 
+    print(f"PnP method: {pnp_method}, lsq method: {lsq_method}")
+    print("Camera matrix K:")
+    print(K)
+    print(f"3D points (LiDAR frame):\n{points_3d}")
+    print(f"2D points (undistorted px):\n{points_2d}")
+
     initial_params = np.zeros(6)
 
     if pnp_method is not None:
-        print(f"Running RANSAC on {len(points_2d)} correspondences...")
+        # The RANSAC inlier threshold must scale with image resolution / focal length.
+        # A fixed 8px is far too strict for high-res / long-focal (zoom) cameras, where a
+        # sub-degree angular error already exceeds it: every hand-placed point gets rejected
+        # and RANSAC reports failure. Scale it to the spread of the 2D correspondences.
+        bbox = points_2d.max(axis=0) - points_2d.min(axis=0)
+        diag = float(np.hypot(*bbox))
+        reproj_thresh = max(8.0, 0.02 * diag)
+        print(
+            f"Running RANSAC on {len(points_2d)} correspondences "
+            f"(reprojection threshold: {reproj_thresh:.1f}px, 2D bbox diag: {diag:.0f}px)..."
+        )
         try:
             # Use solvePnPRansac to get a robust initial estimate and identify inliers
             success, rvec_ransac, tvec_ransac, inliers = cv2.solvePnPRansac(
@@ -57,35 +97,41 @@ def calibrate(
                 points_2d,
                 K,
                 None,
-                iterationsCount=100,
-                reprojectionError=8.0,
+                iterationsCount=1000,
+                reprojectionError=reproj_thresh,
                 flags=pnp_method,
             )
-            if not success:
-                print("RANSAC failed to find a solution.")
-                return np.identity(4)
+            inlier_count = len(inliers) if (success and inliers is not None) else 0
+            if success:
+                print(f"RANSAC found {inlier_count} inliers out of {len(points_2d)} points.")
 
-            inlier_count = len(inliers) if inliers is not None else 0
-            print(f"RANSAC found {inlier_count} inliers out of {len(points_2d)} points.")
-
-            if inlier_count < 4:
-                print("Not enough inliers found by RANSAC.")
-                return np.identity(4)
-
-            # Refine the pose using only the inliers
-            inlier_points_3d = points_3d[inliers.ravel()]
-            inlier_points_2d = points_2d[inliers.ravel()]
-
-            # Initial parameters for least_squares from RANSAC result
-            initial_params = np.concatenate((rvec_ransac.ravel(), tvec_ransac.ravel()))
-            points_3d = inlier_points_3d
-            points_2d = inlier_points_2d
+            if success and inlier_count >= 4:
+                # Refine the pose using only the inliers
+                initial_params = np.concatenate((rvec_ransac.ravel(), tvec_ransac.ravel()))
+                points_3d = points_3d[inliers.ravel()]
+                points_2d = points_2d[inliers.ravel()]
+            else:
+                # RANSAC couldn't form a consensus set (usually correspondence noise, not
+                # outliers). Fall back to a plain all-points solvePnP for the initial guess
+                # rather than giving up — the LM refinement below still uses every point.
+                print(
+                    "RANSAC found no consensus set; falling back to all-points solvePnP "
+                    "(check per-point residuals below — high values mean noisy correspondences)."
+                )
+                _log_pnp_diagnostics(points_3d, points_2d, K)
+                ok, rvec0, tvec0 = cv2.solvePnP(
+                    points_3d, points_2d, K, None, flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if not ok:
+                    print("Plain solvePnP also failed — cannot calibrate.")
+                    return None
+                initial_params = np.concatenate((rvec0.ravel(), tvec0.ravel()))
 
         except cv2.error as e:
             print(f"An OpenCV error occurred during RANSAC: {e}")
             print("Falling back to simple least squares with all points.")
 
-    print("\nRefining pose with inliers using least squares optimization...")
+    print(f"\nRefining pose on {len(points_2d)} points using least squares optimization...")
     res = least_squares(
         objective_function,
         initial_params,
@@ -102,6 +148,14 @@ def calibrate(
     extrinsics = np.identity(4)
     extrinsics[:3, :3] = R_opt
     extrinsics[:3, 3] = tvec_opt.ravel()
+
+    # Report final per-point reprojection error so calibration quality is visible.
+    final_errs = np.abs(res.fun).reshape(-1, 2)
+    final_dist = np.linalg.norm(final_errs, axis=1)
+    print(
+        f"Final reprojection error: mean={final_dist.mean():.2f}px "
+        f"max={final_dist.max():.2f}px over {len(final_dist)} points."
+    )
 
     print("\n---" + "-" * 10 + " Calibration Finished " + "-" * 10 + "---")
     rpy = Rotation.from_matrix(R_opt).as_euler("xyz", degrees=True)

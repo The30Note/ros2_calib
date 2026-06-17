@@ -1076,7 +1076,6 @@ class MainWindow(QMainWindow):
             try:
                 self.current_transform = self._parse_extrinsics_yaml(path)
                 self.extrinsics_source_label.setText(f"Source: {path}")
-                self.tf_source_group.setVisible(False)
                 self._sync_transform_inputs_from_matrix()
                 self._on_extrinsics_changed()
             except Exception as e:

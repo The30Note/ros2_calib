@@ -375,6 +375,25 @@ class CalibrationWidget(QWidget):
         threshold = 1e-6
         return bool(np.any(np.abs(dist_coeffs) > threshold))
 
+    def _undistort_points_for_calib(self, pts_2d):
+        """Return 2D correspondence points in undistorted pinhole pixel space (P=K).
+
+        PnP/projectPoints in calibrate() run a pinhole model with no distortion, so the
+        2D points must be expressed in undistorted pixel coordinates. When rectification
+        is enabled the stored points are already in that space; when it is disabled they
+        are raw distorted pixels and must be undistorted with the appropriate lens model.
+        """
+        pts = np.asarray(pts_2d, dtype=np.float32).reshape(-1, 1, 2)
+        if self.is_rectification_enabled or not self.has_significant_distortion():
+            return pts.reshape(-1, 2)
+        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+        D = np.array(self.camerainfo_msg.d)
+        if self._is_fisheye:
+            und = cv2.fisheye.undistortPoints(pts, K, D[:4].reshape(4, 1), P=K)
+        else:
+            und = cv2.undistortPoints(pts, K, D, P=K)
+        return und.reshape(-1, 2)
+
     def _remap_correspondences(self, to_rectified: bool):
         """Transform stored 2D correspondence keys between distorted and undistorted pixel space."""
         if not self.correspondences:
@@ -1613,18 +1632,49 @@ class CalibrationWidget(QWidget):
         lsq_method = self.lsq_method_combo.currentText()
         K = np.array(self.camerainfo_msg.k).reshape(3, 3)
 
+        # Express 2D correspondences in undistorted pinhole pixel space so the
+        # pinhole-model PnP in calibrate() is valid regardless of lens distortion.
+        raw_pts = list(self.correspondences.keys())
+        und_pts = self._undistort_points_for_calib(raw_pts)
+        und_map = {p2d: tuple(map(float, u)) for p2d, u in zip(raw_pts, und_pts)}
+        print(
+            f"[run_calibration] {len(raw_pts)} correspondences | "
+            f"rectification={'ON' if self.is_rectification_enabled else 'OFF'} | "
+            f"fisheye={self._is_fisheye} | "
+            f"distortion_model={getattr(self.camerainfo_msg, 'distortion_model', '')!r} | "
+            f"D={np.array(self.camerainfo_msg.d).tolist()}"
+        )
+
         if self.has_second_pointcloud and len(self.lidar_to_lidar_correspondences) >= 3:
             # Dual LiDAR calibration
-            master_cam_corr = [(p2d, corr["3d_mean"]) for p2d, corr in self.correspondences.items()]
-            self.extrinsics, self.second_lidar_transform = calibration.calibrate_dual_lidar(
+            master_cam_corr = [
+                (und_map[p2d], corr["3d_mean"]) for p2d, corr in self.correspondences.items()
+            ]
+            new_extrinsics, new_second = calibration.calibrate_dual_lidar(
                 master_cam_corr, self.lidar_to_lidar_correspondences, K, pnp_flag, lsq_method
             )
         else:
             # Single LiDAR calibration
-            calib_corr = [(p2d, corr["3d_mean"]) for p2d, corr in self.correspondences.items()]
-            self.extrinsics = calibration.calibrate(calib_corr, K, pnp_flag, lsq_method)
+            calib_corr = [
+                (und_map[p2d], corr["3d_mean"]) for p2d, corr in self.correspondences.items()
+            ]
+            new_extrinsics = calibration.calibrate(calib_corr, K, pnp_flag, lsq_method)
+            new_second = None
 
         self.progress_bar.setVisible(False)
+
+        if new_extrinsics is None:
+            # Calibration failed — keep the previous transform instead of zeroing out.
+            print("[run_calibration] Calibration failed — keeping previous extrinsics.")
+            self.results_label.setText(
+                "Calibration failed (see console). Keeping previous values."
+            )
+            return
+
+        self.extrinsics = new_extrinsics
+        if new_second is not None:
+            self.second_lidar_transform = new_second
+
         self.project_pointcloud()
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
