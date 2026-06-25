@@ -189,7 +189,10 @@ def detect_with_fallback(detectors, gray, min_keep):
     against the full-res image so their corners aren't half-res-quantized.
     """
     primary, *fallbacks = detectors
-    out  = list(primary.detect(gray))
+    # The primary pass is decimated (large boards are invisible at full res), so
+    # its corners are half-res-quantized — refine every detection against the
+    # full-res image, exactly as we do for fallback tags.
+    out  = [_refine_corners(d, gray) for d in primary.detect(gray)]
     seen = {d.tag_id for d in out}
 
     accepted = [d for d in out
@@ -461,18 +464,27 @@ def main():
     print(f"Image folder : {args.image_dir}")
     print(f"Output       : {out_path}\n")
 
-    # Primary full-res detector + half-res fallback. Half-res catches small/tilted
-    # tags the full-res quad finder misses, but its corners are less precise so we
-    # only use it when full-res is short of min_tags (and refine its corners).
+    # Decimated primary + coarser fallbacks. On a board that fills the frame each
+    # tag is large in pixels, and pupil_apriltags' quad finder misses oversized
+    # tags at full resolution — decimating shrinks them into its working range
+    # (full-res finds ~0 tags on these images, dec=2 finds 16-23). Corners from
+    # the decimated passes are cornerSubPix-refined against the full-res image in
+    # detect_with_fallback, so accuracy is preserved. Coarser fallbacks recover
+    # the hardest images where even dec=2 is short of min_tags.
     detectors = [
         Detector(
             families=TAG_FAMILY, nthreads=2,
-            quad_decimate=1.0, quad_sigma=0.8,
+            quad_decimate=2.0, quad_sigma=0.0,
             refine_edges=1, decode_sharpening=0.5,
         ),
         Detector(
             families=TAG_FAMILY, nthreads=2,
-            quad_decimate=2.0, quad_sigma=0.0,
+            quad_decimate=3.0, quad_sigma=0.0,
+            refine_edges=1, decode_sharpening=0.5,
+        ),
+        Detector(
+            families=TAG_FAMILY, nthreads=2,
+            quad_decimate=4.0, quad_sigma=0.0,
             refine_edges=1, decode_sharpening=0.5,
         ),
     ]
@@ -501,14 +513,18 @@ def main():
                 if probe is not None:
                     H_img, W_img = probe.shape[:2]
                     K_new, map1, map2 = setup_undistort(K_prior, D_prior, (W_img, H_img))
-                    # On undistorted images edges are straight — use full-res, no blur,
-                    # plus a half-res pass for small tags
+                    # Undistorted edges are straight, but tags are still large, so
+                    # decimate the primary pass too (see detectors above) with
+                    # coarser fallbacks for hard images.
                     detectors_undist = [
                         Detector(families=TAG_FAMILY, nthreads=2,
-                                 quad_decimate=1.0, quad_sigma=0.0,
+                                 quad_decimate=2.0, quad_sigma=0.0,
                                  refine_edges=1, decode_sharpening=0.25),
                         Detector(families=TAG_FAMILY, nthreads=2,
-                                 quad_decimate=2.0, quad_sigma=0.0,
+                                 quad_decimate=3.0, quad_sigma=0.0,
+                                 refine_edges=1, decode_sharpening=0.25),
+                        Detector(families=TAG_FAMILY, nthreads=2,
+                                 quad_decimate=4.0, quad_sigma=0.0,
                                  refine_edges=1, decode_sharpening=0.25),
                     ]
                     undistort_setup = (K_new, map1, map2, K_prior, D_prior, detectors_undist)

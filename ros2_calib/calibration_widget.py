@@ -375,6 +375,28 @@ class CalibrationWidget(QWidget):
         threshold = 1e-6
         return bool(np.any(np.abs(dist_coeffs) > threshold))
 
+    def _max_valid_normalized_radius(self, d_raw):
+        """Largest off-axis normalized radius the radial-distortion model maps faithfully.
+
+        Brown-Conrady (plumb_bob) radial distortion is non-monotonic for lenses with
+        strong coefficients (e.g. long-focal zoom lenses). Past the radius where the
+        distorted radius stops increasing, points that are physically outside the lens
+        FoV get folded back toward the image center, producing streak artifacts. We
+        return the first radius where the radial mapping turns over, so callers can cull
+        anything beyond it. Returns inf when the model is monotonic over the sampled range.
+        """
+        d = np.asarray(d_raw, dtype=np.float64).ravel()
+        if d.size < 5:
+            return np.inf
+        k1, k2, k3 = d[0], d[1], d[4]
+        # Sample out to ~45 deg off-axis; legit points for any real lens sit well inside.
+        r = np.linspace(0.0, 1.0, 4000)
+        rd = r * (1.0 + k1 * r**2 + k2 * r**4 + k3 * r**6)
+        turn = np.argmax(np.diff(rd) <= 0.0)
+        if turn == 0:  # no turnover found -> monotonic over the range
+            return np.inf
+        return float(r[turn])
+
     def _undistort_points_for_calib(self, pts_2d):
         """Return 2D correspondence points in undistorted pinhole pixel space (P=K).
 
@@ -526,7 +548,17 @@ class CalibrationWidget(QWidget):
         self.max_value_spinbox.setDecimals(2)
         view_form.addRow("Max:", self.max_value_spinbox)
 
-        # Surface-normals rotation rows (hidden by default)
+        # Surface-normals controls (hidden by default)
+        self._normal_extra_labels = []
+        self.normal_neighbors_spinbox = QSpinBox()
+        self.normal_neighbors_spinbox.setRange(3, 200)
+        self.normal_neighbors_spinbox.setSingleStep(1)
+        self.normal_neighbors_spinbox.setValue(15)
+        view_form.addRow("Normal Neighbors:", self.normal_neighbors_spinbox)
+        self._normal_extra_labels.append(
+            view_form.itemAt(view_form.rowCount() - 1, QFormLayout.LabelRole).widget()
+        )
+
         self._normal_rot_labels = []
         self._normal_rot_spinboxes = []
         for lbl_text in ("Roll (°):", "Pitch (°):", "Yaw (°):"):
@@ -646,6 +678,7 @@ class CalibrationWidget(QWidget):
         self.colorization_mode_combo.currentTextChanged.connect(self._on_colorization_mode_changed)
         for sb in self._normal_rot_spinboxes:
             sb.valueChanged.connect(self._on_view_params_changed)
+        self.normal_neighbors_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.max_value_spinbox.valueChanged.connect(self._on_view_params_changed)
 
@@ -694,6 +727,9 @@ class CalibrationWidget(QWidget):
         for lbl, sb in zip(self._normal_rot_labels, self._normal_rot_spinboxes):
             lbl.setVisible(visible)
             sb.setVisible(visible)
+        self.normal_neighbors_spinbox.setVisible(visible)
+        for lbl in self._normal_extra_labels:
+            lbl.setVisible(visible)
 
     def _on_opacity_changed(self, value: float):
         """Opacity only needs a repaint — no rebuild."""
@@ -994,17 +1030,20 @@ class CalibrationWidget(QWidget):
 
     def toggle_selection_mode(self, checked):
         if checked:
+            # Red "cancel" styling makes it obvious that clicking the button again
+            # aborts the in-progress correspondence selection.
+            self.add_corr_button.setStyleSheet(UIStyles.CANCEL_BUTTON)
             if self.has_second_pointcloud:
                 corr_mode = self.correspondence_mode_combo.currentText()
                 if corr_mode == "Master LiDAR ↔ Camera":
                     self.selection_mode = "wait_for_2d_click"
-                    self.add_corr_button.setText("1. Click on 2D Image Point")
+                    self.add_corr_button.setText("✕ Cancel — 1. Click on 2D Image Point")
                 else:  # Second LiDAR ↔ Master LiDAR
                     self.selection_mode = "wait_for_second_lidar_click"
-                    self.add_corr_button.setText("1. Click on Second LiDAR Point")
+                    self.add_corr_button.setText("✕ Cancel — 1. Click on Second LiDAR Point")
             else:
                 self.selection_mode = "wait_for_2d_click"
-                self.add_corr_button.setText("1. Click on 2D Image Point")
+                self.add_corr_button.setText("✕ Cancel — 1. Click on 2D Image Point")
             self.view.setDragMode(QGraphicsView.NoDrag)
         else:
             self.reset_selection_mode()
@@ -1035,7 +1074,7 @@ class CalibrationWidget(QWidget):
         self.selected_2d_point = (scene_pos.x(), scene_pos.y())
         self.draw_cross_marker(scene_pos, QColor(Colors.CORRESPONDENCE_2D))
         self.selection_mode = "wait_for_3d_clicks"
-        self.add_corr_button.setText("2. Click on LiDAR Point(s)")
+        self.add_corr_button.setText("✕ Cancel — 2. Click on LiDAR Point(s)")
         self.confirm_3d_button.setVisible(True)
 
     def handle_3d_point_selection(self, pos):
@@ -1087,7 +1126,7 @@ class CalibrationWidget(QWidget):
 
         # Move to next mode
         self.selection_mode = "wait_for_master_lidar_clicks"
-        self.add_corr_button.setText("2. Click on Master LiDAR Point(s)")
+        self.add_corr_button.setText("✕ Cancel — 2. Click on Master LiDAR Point(s)")
         self.confirm_3d_button.setVisible(True)
 
     def handle_master_lidar_point_selection(self, pos):
@@ -1187,6 +1226,7 @@ class CalibrationWidget(QWidget):
         self.selected_3d_items_map = {}
         self.add_corr_button.setChecked(False)
         self.add_corr_button.setText("Add Correspondence")
+        self.add_corr_button.setStyleSheet(self.default_button_style)
         self.confirm_3d_button.setVisible(False)
         self._update_confirm_button_state()
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -1313,6 +1353,17 @@ class CalibrationWidget(QWidget):
             & (points_proj_cv[:, 1] < self.camerainfo_msg.height)
         )
 
+        # Cull points beyond the lens FoV that the radial-distortion polynomial folds
+        # back into the frame (streak artifacts on strong-distortion / zoom lenses).
+        if not self._is_fisheye:
+            r_max = self._max_valid_normalized_radius(d_raw)
+            if np.isfinite(r_max):
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    r_norm = np.hypot(
+                        points_cam[:, 0] / z_cam, points_cam[:, 1] / z_cam
+                    )
+                mask &= r_norm <= r_max
+
         if self.occlusion_mask is not None and len(self.occlusion_mask) == len(mask):
             mask = np.logical_and(mask, self.occlusion_mask)
 
@@ -1340,7 +1391,10 @@ class CalibrationWidget(QWidget):
             norm_values = np.clip((scores - min_val) / (max_val - min_val + 1e-6), 0, 1)
             colors = cmap(norm_values)
         elif colorization_mode == "Surface Normals":
-            normals = self._compute_normals(self.points_xyz[self.valid_indices])
+            normals = self._compute_normals(
+                self.points_xyz[self.valid_indices],
+                k=self.normal_neighbors_spinbox.value(),
+            )
             roll_deg, pitch_deg, yaw_deg = (
                 sb.value() for sb in self._normal_rot_spinboxes
             )

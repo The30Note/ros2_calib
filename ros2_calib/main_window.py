@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QDoubleSpinBox,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -69,7 +70,7 @@ from .lidar2lidar_o3d_widget import launch_lidar2lidar_calibration
 from .tf_graph_widget import TFGraphWidget
 
 MAX_RENDER_POINTS = 500_000
-VOXEL_SIZE_INIT   = 0.02    # metres — starting voxel size for density equalisation
+VOXEL_SIZE_INIT   = 0.01    # metres — default starting voxel size for density equalisation
 
 
 class MainWindow(QMainWindow):
@@ -284,6 +285,46 @@ class MainWindow(QMainWindow):
         self.camerainfo_topic_combo.currentTextChanged.connect(self._on_topic_changed)
         row2.addWidget(self._info_label)
         row2.addWidget(self.camerainfo_topic_combo, 1)
+
+        self._frames_label = QLabel("Frames:")
+        self.frame_samples_spinbox = QSpinBox()
+        self.frame_samples_spinbox.setRange(1, 9999)
+        self.frame_samples_spinbox.setValue(12)
+        self.frame_samples_spinbox.setToolTip(
+            "Max number of synchronised LiDAR frames to read from the bag.\n"
+            "Frames are uniformly sampled; use a higher count for a denser\n"
+            "accumulated cloud, 1 to load just a single frame."
+        )
+        row2.addWidget(self._frames_label)
+        row2.addWidget(self.frame_samples_spinbox)
+
+        self._max_points_label = QLabel("Max Points:")
+        self.max_points_spinbox = QSpinBox()
+        self.max_points_spinbox.setRange(1_000, 50_000_000)
+        self.max_points_spinbox.setSingleStep(50_000)
+        self.max_points_spinbox.setGroupSeparatorShown(True)
+        self.max_points_spinbox.setValue(MAX_RENDER_POINTS)
+        self.max_points_spinbox.setToolTip(
+            "Voxel-downsampling cap on the accumulated cloud.\n"
+            "Voxel size grows until the merged cloud fits within this many points.\n"
+            "Lower for faster rendering, higher to keep more detail."
+        )
+        row2.addWidget(self._max_points_label)
+        row2.addWidget(self.max_points_spinbox)
+
+        self._voxel_label = QLabel("Voxel (m):")
+        self.voxel_size_spinbox = QDoubleSpinBox()
+        self.voxel_size_spinbox.setRange(0.001, 1.0)
+        self.voxel_size_spinbox.setSingleStep(0.005)
+        self.voxel_size_spinbox.setDecimals(3)
+        self.voxel_size_spinbox.setValue(VOXEL_SIZE_INIT)
+        self.voxel_size_spinbox.setToolTip(
+            "Starting voxel cell size for the accumulated cloud.\n"
+            "Smaller keeps more detail (denser at distance); the voxel only grows\n"
+            "from here if needed to stay under Max Points."
+        )
+        row2.addWidget(self._voxel_label)
+        row2.addWidget(self.voxel_size_spinbox)
 
         self.process_button = QPushButton("▶  Process Bag")
         self.process_button.setFixedHeight(30)
@@ -734,7 +775,7 @@ class MainWindow(QMainWindow):
             total_messages=get_total_message_count(
                 self.bag_file, self.ros_version_combo.currentText()
             ),
-            frame_samples=9999,   # read all available synchronised pairs
+            frame_samples=self.frame_samples_spinbox.value(),   # max synchronised pairs to read
             topic_message_counts={n: c for n, _, c in self.topics},
             ros_version=self.ros_version_combo.currentText(),
             sync_tolerance=0.05,
@@ -851,7 +892,11 @@ class MainWindow(QMainWindow):
         combined = np.concatenate(parts)
 
         # Density-equalise with voxel grid downsampling
-        downsampled = self._voxel_downsample(combined, target_max=MAX_RENDER_POINTS)
+        downsampled = self._voxel_downsample(
+            combined,
+            target_max=self.max_points_spinbox.value(),
+            voxel_size=self.voxel_size_spinbox.value(),
+        )
 
         n = len(downsampled)
         return ros_utils.PointCloud2(
@@ -871,10 +916,12 @@ class MainWindow(QMainWindow):
             is_dense=True,
         )
 
-    def _voxel_downsample(self, arr: np.ndarray, target_max: int) -> np.ndarray:
+    def _voxel_downsample(
+        self, arr: np.ndarray, target_max: int, voxel_size: float = VOXEL_SIZE_INIT
+    ) -> np.ndarray:
         """Keep one point per voxel cell for uniform spatial density.
 
-        Starts at VOXEL_SIZE_INIT and increases by 50 % each iteration until the
+        Starts at voxel_size and increases by 50 % each iteration until the
         result fits within target_max points.  np.unique returns the *first* index
         for each occupied voxel, so earlier frames naturally win (they accumulate
         cleanly without duplication).
@@ -885,7 +932,6 @@ class MainWindow(QMainWindow):
             arr["z"].astype(np.float64),
         ])
 
-        voxel_size = VOXEL_SIZE_INIT
         while True:
             mins = xyz.min(axis=0)
             vi = ((xyz - mins) / voxel_size).astype(np.int64)

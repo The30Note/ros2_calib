@@ -43,6 +43,21 @@ class UIStyles:
         }
     """
 
+    # Cancel style - red background, used while a correspondence selection is active
+    CANCEL_BUTTON = """
+        QPushButton {
+            background-color: #c0392b;
+            color: white;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #e74c3c;
+        }
+        QPushButton:pressed {
+            background-color: #a93226;
+        }
+    """
+
     # Default button style - system default appearance
     DEFAULT_BUTTON = ""
 
