@@ -66,7 +66,11 @@ from .bag_handler import (
 )
 from .calibration_widget import CalibrationWidget
 from .common import UIStyles
-from .lidar2lidar_o3d_widget import launch_lidar2lidar_calibration
+# NOTE: lidar2lidar_o3d_widget imports open3d, whose PyPI wheels are built with
+# AVX2/FMA. On CPUs without AVX (e.g. Apollo Lake Celeron J3455), importing
+# open3d raises SIGILL ("Illegal instruction"). Import it lazily inside the
+# LiDAR-to-LiDAR launch path so the rest of the app (LiDAR-to-Camera) still runs
+# on such machines.
 from .tf_graph_widget import TFGraphWidget
 
 MAX_RENDER_POINTS = 500_000
@@ -1490,6 +1494,9 @@ class MainWindow(QMainWindow):
 
     def _run_lidar_calibration_thread(self, pc1, pc2, initial_transform):
         try:
+            # Imported lazily: open3d SIGILLs on CPUs without AVX (see note at top).
+            from .lidar2lidar_o3d_widget import launch_lidar2lidar_calibration
+
             launch_lidar2lidar_calibration(pc1, pc2, initial_transform, self._on_lidar_cal_done)
         except Exception as e:
             print(f"[ERROR] LiDAR calibration thread: {e}")
