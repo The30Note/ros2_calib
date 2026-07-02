@@ -162,6 +162,9 @@ def write_debug_image(path: Path, img: np.ndarray, accepted, ignored, debug_dir:
 _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
 
 
+_SUBPIX_WIN = 5
+
+
 def _refine_corners(det, gray):
     """Snap corner positions to the nearest sub-pixel edge in the full-res image.
 
@@ -169,45 +172,50 @@ def _refine_corners(det, gray):
     (it locks onto the middle of the border pixel rather than the outer edge);
     cornerSubPix uses the local gradient to pull each corner to the correct spot.
     """
-    pts = det.corners.astype(np.float32).reshape(-1, 1, 2).copy()
-    cv2.cornerSubPix(gray, pts, (5, 5), (-1, -1), _SUBPIX_CRITERIA)
+    h, w = gray.shape[:2]
+    # cornerSubPix samples a (2*win+1)² neighbourhood around each corner and
+    # raises an assertion if that window falls outside the image. Fisheye frames
+    # routinely place a tag hard against the frame edge, so guard the bounds and
+    # keep the raw corner rather than crashing the whole run.
+    m = _SUBPIX_WIN + 2
+    c = det.corners
+    if (c[:, 0] < m).any() or (c[:, 0] >= w - m).any() or \
+       (c[:, 1] < m).any() or (c[:, 1] >= h - m).any():
+        return det if isinstance(det, TagDetection) else \
+            TagDetection(det.tag_id, c.astype(np.float32), c.mean(axis=0).astype(np.float32))
+
+    pts = c.astype(np.float32).reshape(-1, 1, 2).copy()
+    cv2.cornerSubPix(gray, pts, (_SUBPIX_WIN, _SUBPIX_WIN), (-1, -1), _SUBPIX_CRITERIA)
     refined = pts.reshape(-1, 2)
     # Drop the refinement if it pulled any corner more than 4 px — that means
     # cornerSubPix latched onto an adjacent feature rather than this tag's corner.
-    if np.max(np.linalg.norm(refined - det.corners, axis=1)) > 4.0:
-        return det
+    if np.max(np.linalg.norm(refined - c, axis=1)) > 4.0:
+        return det if isinstance(det, TagDetection) else \
+            TagDetection(det.tag_id, c.astype(np.float32), c.mean(axis=0).astype(np.float32))
     return TagDetection(det.tag_id, refined.astype(np.float32), refined.mean(axis=0).astype(np.float32))
 
 
-def detect_with_fallback(detectors, gray, min_keep):
-    """Run the primary detector; only fall back to coarser detectors if needed.
+def detect_multi(detectors, gray):
+    """Run every detector pass and merge detections by tag id (finest-wins).
 
-    Coarser (decimated) passes find more tags on small/tilted boards but place
-    corners less precisely. Using them only when the primary pass is short of
-    `min_keep` keeps corner quality high on easy images and recovers tags on
-    hard ones. Newly-found tags from fallback passes get cornerSubPix-refined
-    against the full-res image so their corners aren't half-res-quantized.
+    Each pass uses a different quad_decimate/quad_sigma and therefore sees a
+    different subset of the board: large near tags resolve best at low
+    decimation, while small/far/tilted tags only appear at high decimation or
+    after blurring. On the fisheye set the union of all passes finds ~2× the tags
+    of any single pass, which is what makes hard frames usable at all.
+
+    `detectors` MUST be ordered so the pass most likely to give the *best corners*
+    for a tag comes first (ascending quad_decimate). The first pass to report a
+    tag id supplies its corners; later passes only add ids not yet seen. Every
+    kept detection is cornerSubPix-refined against the full-res image so corners
+    from decimated passes are not left quantized.
     """
-    primary, *fallbacks = detectors
-    # The primary pass is decimated (large boards are invisible at full res), so
-    # its corners are half-res-quantized — refine every detection against the
-    # full-res image, exactly as we do for fallback tags.
-    out  = [_refine_corners(d, gray) for d in primary.detect(gray)]
-    seen = {d.tag_id for d in out}
-
-    accepted = [d for d in out
-                if d.tag_id < TAG_ID_OFFSET + GRID_ROWS * GRID_COLS
-                and d.tag_id not in IGNORED_TAG_IDS]
-    if len(accepted) >= min_keep:
-        return out
-
-    for det in fallbacks:
+    merged = {}
+    for det in detectors:
         for d in det.detect(gray):
-            if d.tag_id in seen:
-                continue
-            seen.add(d.tag_id)
-            out.append(_refine_corners(d, gray))
-    return out
+            if d.tag_id not in merged:
+                merged[d.tag_id] = d
+    return [_refine_corners(d, gray) for d in merged.values()]
 
 
 def load_images(image_dir: Path, detectors, min_tags: int,
@@ -232,15 +240,15 @@ def load_images(image_dir: Path, detectors, min_tags: int,
         if image_size is None:
             image_size = (gray.shape[1], gray.shape[0])  # (W, H)
 
-        # Full-res detect; only fall back to half-res if too few accepted tags.
-        all_dets = detect_with_fallback(detectors, gray, min_tags)
+        # Merge detections across all decimation/blur passes (see detect_multi).
+        all_dets = detect_multi(detectors, gray)
 
-        # If a prior calibration is available and we still need more tags,
-        # also detect on the undistorted image and merge in new tag IDs.
+        # If a prior calibration is available, also detect on the undistorted
+        # image and merge in any tag IDs the distorted passes missed.
         if undistort_setup is not None:
             K_new, map1, map2, K_prior, D_prior, detectors_undist = undistort_setup
             undist   = cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
-            und_dets = detect_with_fallback(detectors_undist, undist, min_tags)
+            und_dets = detect_multi(detectors_undist, undist)
             und_dets = remap_detections(und_dets, K_new, K_prior, D_prior)
             seen = {d.tag_id for d in all_dets}
             all_dets = all_dets + [d for d in und_dets if d.tag_id not in seen]
@@ -275,6 +283,70 @@ def load_images(image_dir: Path, detectors, min_tags: int,
     return all_obj, all_img, used_paths, image_size
 
 
+# ── Robust calibration (iterative outlier rejection) ────────────────────────
+
+def _view_reproj_errors(all_obj, all_img, rvecs, tvecs, K, D, project):
+    """Mean per-view reprojection error (px) for each view."""
+    errs = []
+    for obj, img, rvec, tvec in zip(all_obj, all_img, rvecs, tvecs):
+        proj = project(obj, rvec, tvec, K, D)
+        errs.append(float(np.linalg.norm(img - proj, axis=1).mean()))
+    return errs
+
+
+def calibrate_robust(all_obj, all_img, used_paths, image_size, calib_fn, project,
+                     abs_thresh=1.0, rel_thresh=2.5, min_frac=0.6, max_iters=4):
+    """Calibrate, drop the worst-fitting views, refit — repeat until stable.
+
+    A few bad frames (motion blur, a mislocalised corner, a near-degenerate
+    board pose) can dominate the RMS and bias the intrinsics. After each fit we
+    drop views whose mean reprojection error exceeds max(abs_thresh,
+    rel_thresh*median) and refit on the survivors. At least `min_frac` of the
+    original views are always kept so a uniformly noisy set can't be whittled
+    down to a degenerate handful. Returns
+    (K, D, rvecs, tvecs, rms, kept_obj, kept_img, kept_paths, errs).
+    """
+    obj, img, paths = list(all_obj), list(all_img), list(used_paths)
+    min_keep = max(4, int(round(len(all_obj) * min_frac)))
+    result = None
+    for it in range(max_iters):
+        K, D, rvecs, tvecs, rms = calib_fn(obj, img, image_size)
+        errs = _view_reproj_errors(obj, img, rvecs, tvecs, K, D, project)
+        result = (K, D, rvecs, tvecs, rms, obj, img, paths, errs)
+        if len(obj) <= min_keep:
+            break
+        med = float(np.median(errs))
+        thresh = max(abs_thresh, rel_thresh * med)
+        keep = [i for i, e in enumerate(errs) if e <= thresh]
+        if len(keep) == len(obj):
+            break  # converged — nothing exceeds the threshold
+        if len(keep) < min_keep:  # keep the min_keep lowest-error views
+            keep = sorted(int(i) for i in np.argsort(errs)[:min_keep])
+        dropped = [paths[i].name for i in range(len(paths)) if i not in keep]
+        print(f"  [reject] pass {it + 1}: rms {rms:.3f}px, dropping "
+              f"{len(obj) - len(keep)} view(s) > {thresh:.2f}px: {', '.join(dropped)}")
+        obj = [obj[i] for i in keep]
+        img = [img[i] for i in keep]
+        paths = [paths[i] for i in keep]
+    return result
+
+
+def _project_zoom(obj, rvec, tvec, K, D):
+    proj, _ = cv2.projectPoints(obj, rvec, tvec, K, D)
+    return proj.reshape(-1, 2)
+
+
+def _project_fisheye(obj, rvec, tvec, K, D):
+    proj, _ = cv2.fisheye.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, K, D)
+    return proj.reshape(-1, 2)
+
+
+def print_view_errors(used_paths, errs, model_name):
+    print(f"\nPer-image reprojection errors ({model_name}):")
+    for path, err in zip(used_paths, errs):
+        print(f"  {path.name}: {err:.4f} px")
+
+
 # ── Fisheye calibration ──────────────────────────────────────────────────────
 
 def calibrate_fisheye(all_obj, all_img, image_size):
@@ -307,16 +379,6 @@ def calibrate_fisheye(all_obj, all_img, image_size):
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-7),
     )
     return K, D, rvecs, tvecs, rms
-
-
-def per_image_errors_fisheye(all_obj, all_img, K, D, rvecs, tvecs, used_paths):
-    print("\nPer-image reprojection errors (fisheye):")
-    for obj, img, rvec, tvec, path in zip(all_obj, all_img, rvecs, tvecs, used_paths):
-        proj, _ = cv2.fisheye.projectPoints(
-            obj.reshape(-1, 1, 3), rvec, tvec, K, D
-        )
-        err = np.linalg.norm(img - proj.reshape(-1, 2), axis=1).mean()
-        print(f"  {path.name}: {err:.4f} px")
 
 
 class _InlineList(list):
@@ -383,14 +445,6 @@ def calibrate_zoom(all_obj, all_img, image_size):
         all_obj, all_img, image_size, None, None
     )
     return K, dist, rvecs, tvecs, rms
-
-
-def per_image_errors_zoom(all_obj, all_img, K, dist, rvecs, tvecs, used_paths):
-    print("\nPer-image reprojection errors (plumb_bob):")
-    for obj, img, rvec, tvec, path in zip(all_obj, all_img, rvecs, tvecs, used_paths):
-        proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
-        err = np.linalg.norm(img - proj.reshape(-1, 2), axis=1).mean()
-        print(f"  {path.name}: {err:.4f} px")
 
 
 def save_zoom(K, dist, image_size, rms, out_path):
@@ -464,30 +518,19 @@ def main():
     print(f"Image folder : {args.image_dir}")
     print(f"Output       : {out_path}\n")
 
-    # Decimated primary + coarser fallbacks. On a board that fills the frame each
-    # tag is large in pixels, and pupil_apriltags' quad finder misses oversized
-    # tags at full resolution — decimating shrinks them into its working range
-    # (full-res finds ~0 tags on these images, dec=2 finds 16-23). Corners from
-    # the decimated passes are cornerSubPix-refined against the full-res image in
-    # detect_with_fallback, so accuracy is preserved. Coarser fallbacks recover
-    # the hardest images where even dec=2 is short of min_tags.
-    detectors = [
-        Detector(
-            families=TAG_FAMILY, nthreads=2,
-            quad_decimate=2.0, quad_sigma=0.0,
-            refine_edges=1, decode_sharpening=0.5,
-        ),
-        Detector(
-            families=TAG_FAMILY, nthreads=2,
-            quad_decimate=3.0, quad_sigma=0.0,
-            refine_edges=1, decode_sharpening=0.5,
-        ),
-        Detector(
-            families=TAG_FAMILY, nthreads=2,
-            quad_decimate=4.0, quad_sigma=0.0,
-            refine_edges=1, decode_sharpening=0.5,
-        ),
-    ]
+    # Multi-pass detection, merged in detect_multi (ordered finest-corners-first).
+    # No single decimation is enough: near/large tags resolve best at low
+    # decimation while small/far/tilted tags only appear at high decimation or
+    # after a blur. Merging the union of these passes roughly doubles the tags
+    # found per frame on the fisheye set and is what keeps hard frames usable.
+    # Ordered ascending so the pass with the best raw corners wins each tag id;
+    # all kept corners are then cornerSubPix-refined against the full-res image.
+    _dec = lambda d, sigma=0.0: Detector(  # noqa: E731
+        families=TAG_FAMILY, nthreads=2,
+        quad_decimate=d, quad_sigma=sigma,
+        refine_edges=1, decode_sharpening=0.5,
+    )
+    detectors = [_dec(1.0), _dec(1.5), _dec(2.0), _dec(3.0), _dec(4.0), _dec(2.0, 0.8)]
 
     debug_dir = args.image_dir / "debug_images" if args.debug_images else None
     if debug_dir:
@@ -513,19 +556,17 @@ def main():
                 if probe is not None:
                     H_img, W_img = probe.shape[:2]
                     K_new, map1, map2 = setup_undistort(K_prior, D_prior, (W_img, H_img))
-                    # Undistorted edges are straight, but tags are still large, so
-                    # decimate the primary pass too (see detectors above) with
-                    # coarser fallbacks for hard images.
+                    # Undistorted edges are straight, but tags span the same size
+                    # range, so use the same ascending multi-pass set (merged in
+                    # detect_multi) as the distorted detectors above.
+                    _dec_u = lambda d, sigma=0.0: Detector(  # noqa: E731
+                        families=TAG_FAMILY, nthreads=2,
+                        quad_decimate=d, quad_sigma=sigma,
+                        refine_edges=1, decode_sharpening=0.25,
+                    )
                     detectors_undist = [
-                        Detector(families=TAG_FAMILY, nthreads=2,
-                                 quad_decimate=2.0, quad_sigma=0.0,
-                                 refine_edges=1, decode_sharpening=0.25),
-                        Detector(families=TAG_FAMILY, nthreads=2,
-                                 quad_decimate=3.0, quad_sigma=0.0,
-                                 refine_edges=1, decode_sharpening=0.25),
-                        Detector(families=TAG_FAMILY, nthreads=2,
-                                 quad_decimate=4.0, quad_sigma=0.0,
-                                 refine_edges=1, decode_sharpening=0.25),
+                        _dec_u(1.0), _dec_u(1.5), _dec_u(2.0),
+                        _dec_u(3.0), _dec_u(4.0), _dec_u(2.0, 0.8),
                     ]
                     undistort_setup = (K_new, map1, map2, K_prior, D_prior, detectors_undist)
                     print(f"Initial-guess intrinsics loaded from {args.initial_guess} — undistorting before detection\n")
@@ -543,14 +584,22 @@ def main():
     print("Running calibration …")
 
     if args.context:
-        K, D, rvecs, tvecs, rms = calibrate_fisheye(all_obj, all_img, image_size)
-        print(f"\nOverall RMS reprojection error: {rms:.4f} px")
-        per_image_errors_fisheye(all_obj, all_img, K, D, rvecs, tvecs, used_paths)
+        K, D, rvecs, tvecs, rms, _o, _i, kept_paths, errs = calibrate_robust(
+            all_obj, all_img, used_paths, image_size,
+            calibrate_fisheye, _project_fisheye,
+        )
+        print(f"\nKept {len(kept_paths)} / {len(used_paths)} views after rejection")
+        print(f"Overall RMS reprojection error: {rms:.4f} px")
+        print_view_errors(kept_paths, errs, "fisheye")
         save_fisheye(K, D, image_size, rms, out_path)
     else:
-        K, dist, rvecs, tvecs, rms = calibrate_zoom(all_obj, all_img, image_size)
-        print(f"\nOverall RMS reprojection error: {rms:.4f} px")
-        per_image_errors_zoom(all_obj, all_img, K, dist, rvecs, tvecs, used_paths)
+        K, dist, rvecs, tvecs, rms, _o, _i, kept_paths, errs = calibrate_robust(
+            all_obj, all_img, used_paths, image_size,
+            calibrate_zoom, _project_zoom,
+        )
+        print(f"\nKept {len(kept_paths)} / {len(used_paths)} views after rejection")
+        print(f"Overall RMS reprojection error: {rms:.4f} px")
+        print_view_errors(kept_paths, errs, "plumb_bob")
         save_zoom(K, dist, image_size, rms, out_path)
 
 
