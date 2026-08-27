@@ -26,13 +26,15 @@ dependencies = [
     "rosbags",
     "numpy",
     "PySide6",
-    "opencv-python-headless",
+    "opencv-python-headless>=4.8,<5",
     "scipy",
     "NodeGraphQt",
     "transforms3d",
     "setuptools",
     "open3d",
-    "pyyaml"
+    "pyyaml",
+    "matplotlib",
+    "pupil-apriltags"
 ]
 
 [project.urls]
