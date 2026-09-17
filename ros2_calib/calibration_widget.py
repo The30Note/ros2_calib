@@ -583,11 +583,16 @@ class CalibrationWidget(QWidget):
             corr_sec.add_widget(self.correspondence_mode_combo)
 
         self.add_corr_button = QPushButton("Add Correspondence")
+        self.add_corr_button.setToolTip(
+            "Middle-click the image to start a correspondence there.\n"
+            "Left-click to pick LiDAR points, right-click to save it."
+        )
         self.add_corr_button.setCheckable(True)
         self.add_corr_button.toggled.connect(self.toggle_selection_mode)
         corr_sec.add_widget(self.add_corr_button)
 
         self.confirm_3d_button = QPushButton("Confirm 3D Selection")
+        self.confirm_3d_button.setToolTip("Same as right-clicking the image")
         self.confirm_3d_button.setVisible(False)
         self.confirm_3d_button.clicked.connect(self.finalize_correspondence)
         corr_sec.add_widget(self.confirm_3d_button)
@@ -1022,24 +1027,62 @@ class CalibrationWidget(QWidget):
             self.reset_selection_mode()
 
     def eventFilter(self, source, event):
-        if (
-            source is self.view.viewport()
-            and event.type() == QEvent.MouseButtonRelease
-            and event.button() == Qt.LeftButton
-        ):
-            if self.selection_mode == "wait_for_2d_click":
-                self.handle_2d_point_selection(event.pos())
+        """Mouse bindings on the image view.
+
+        left   — place the 2D point, then pick/unpick LiDAR points
+        middle — start a correspondence right here (no button press needed)
+        right  — save the correspondence with whatever is selected
+        """
+        if source is self.view.viewport():
+            # Swallow the press so the view does not pan or open a context menu;
+            # the matching release below is what acts.
+            if (event.type() == QEvent.MouseButtonPress
+                    and event.button() in (Qt.MiddleButton, Qt.RightButton)):
                 return True
-            elif self.selection_mode == "wait_for_3d_clicks":
-                self.handle_3d_point_selection(event.pos())
-                return True
-            elif self.selection_mode == "wait_for_second_lidar_click":
-                self.handle_second_lidar_point_selection(event.pos())
-                return True
-            elif self.selection_mode == "wait_for_master_lidar_clicks":
-                self.handle_master_lidar_point_selection(event.pos())
-                return True
+
+            if event.type() == QEvent.MouseButtonRelease:
+                if event.button() == Qt.MiddleButton:
+                    self.start_correspondence_at(event.pos())
+                    return True
+
+                if event.button() == Qt.RightButton:
+                    if self.selection_mode is not None:
+                        self.finalize_correspondence()
+                    return True
+
+                if event.button() == Qt.LeftButton:
+                    if self.selection_mode == "wait_for_2d_click":
+                        self.handle_2d_point_selection(event.pos())
+                        return True
+                    elif self.selection_mode == "wait_for_3d_clicks":
+                        self.handle_3d_point_selection(event.pos())
+                        return True
+                    elif self.selection_mode == "wait_for_second_lidar_click":
+                        self.handle_second_lidar_point_selection(event.pos())
+                        return True
+                    elif self.selection_mode == "wait_for_master_lidar_clicks":
+                        self.handle_master_lidar_point_selection(event.pos())
+                        return True
         return super().eventFilter(source, event)
+
+    def start_correspondence_at(self, pos):
+        """Middle-click: begin a correspondence and anchor its first point here.
+
+        Equivalent to pressing Add Correspondence and then clicking, so an
+        in-progress correspondence simply has its first point moved.
+        """
+        if self.selection_mode is None:
+            self.add_corr_button.blockSignals(True)
+            self.add_corr_button.setChecked(True)
+            self.add_corr_button.blockSignals(False)
+            self.toggle_selection_mode(True)
+
+        if self.selection_mode in ("wait_for_second_lidar_click",
+                                   "wait_for_master_lidar_clicks"):
+            if self.selection_mode == "wait_for_second_lidar_click":
+                self.handle_second_lidar_point_selection(pos)
+        else:
+            self.handle_2d_point_selection(pos)
 
     def handle_2d_point_selection(self, pos):
         self.clear_temp_markers()

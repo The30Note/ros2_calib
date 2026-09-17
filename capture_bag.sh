@@ -6,20 +6,20 @@
 # Usage:
 #   ./capture_bag.sh user@server --serial vss_016
 #   ./capture_bag.sh dockware@beyonce --serial vss_016
-#   ./capture_bag.sh dockware@beyonce --serial vss_016 --duration 30
+#   ./capture_bag.sh dockware@beyonce --serial vss_016 --duration 10
 #   ./capture_bag.sh --local --serial vss_016
-#   ./capture_bag.sh --local --serial vss_016 --duration 30
+#   ./capture_bag.sh --local --serial vss_016 --duration 10
 #
 # Options:
 #   --local                Capture from the local Docker daemon instead of SSHing remotely.
 #   --serial <serial>      Sensor suite serial (e.g. vss_016). vss_ prefix auto-added if missing.
-#   --duration <seconds>   Recording duration in seconds (default: 5)
+#   --duration <seconds>   Recording duration in seconds (default: 3)
 
 set -e
 
 TARGET=""
 SERIAL=""
-DURATION=5
+DURATION=3
 LOCAL=0
 
 while [[ "$#" -gt 0 ]]; do

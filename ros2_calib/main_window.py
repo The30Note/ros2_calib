@@ -677,6 +677,10 @@ class MainWindow(QMainWindow):
         if self.bag_file:
             # Topics and the device intrinsics file both differ per camera.
             self._auto_load_intrinsics()
+            # Re-read the bag for the other camera's image topic so the view
+            # switches over without a second trip to Process Bag.
+            if self.process_button.isEnabled():
+                self.process_rosbag_data()
 
     # ================================================================== #
     #  Bag loading                                                         #
@@ -763,7 +767,16 @@ class MainWindow(QMainWindow):
     #  Bag processing                                                      #
     # ================================================================== #
 
+    def _worker_running(self) -> bool:
+        worker = getattr(self, "processing_worker", None)
+        try:
+            return worker is not None and worker.isRunning()
+        except RuntimeError:
+            return False    # deleted by Qt
+
     def process_rosbag_data(self):
+        if self._worker_running():
+            return
         self.process_progress.setVisible(True)
         self.process_progress.setValue(0)
         self.process_button.setEnabled(False)

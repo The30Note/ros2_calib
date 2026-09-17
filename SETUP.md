@@ -101,14 +101,18 @@ ros2_calib
 
 Then, in the app:
 
-1. Pick the camera — **Context** or **Zoom**.
+1. Pick the camera — **Context** or **Zoom**. Switching cameras after a bag is
+   loaded re-processes it for that camera's image topic automatically.
 2. Load a rosbag (`.mcap`) — the dialog opens in `bags/`.
 3. Topics are fixed (`/context_camera/main` or `/zoom_camera/main`, plus
    `/livox/lidar` and the matching `camera_info`) and only displayed; the row turns
    red if the loaded bag is missing one. The ROS distro is fixed too — see
    `ROS_DISTRO` in `ros2_calib/main_window.py` if a bag ever needs a different one.
 4. Set the initial transform / pick a synchronized frame.
-5. Place correspondences (LiDAR-to-Camera) or nudge + ICP (LiDAR-to-LiDAR).
+5. Place correspondences. On the image view: **middle-click** starts one at that
+   pixel, **left-click** picks (or unpicks) LiDAR points, **right-click** saves it
+   with whatever is selected. The Add Correspondence / Confirm buttons still work
+   the same way.
 6. Export the result to a YAML transform file.
 
 Intrinsics are auto-loaded in this order: the device's own calibration at
@@ -187,8 +191,8 @@ Records a short `.mcap` bag from a running sensor-suite container and copies it 
 SSH access unless you pass `--local`.
 
 ```bash
-./capture_bag.sh dockware@beyonce --serial vss_016 --duration 30
-./capture_bag.sh --local --serial vss_016
+./capture_bag.sh dockware@beyonce --serial vss_016 --duration 10
+./capture_bag.sh --local --serial vss_016          # 3s by default
 ```
 
 ## 5. Troubleshooting
