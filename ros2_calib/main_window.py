@@ -219,9 +219,46 @@ class MainWindow(QMainWindow):
 
     @property
     def _device_serial(self) -> str:
-        """Serial parsed from the loaded bag path, e.g. vss_00000029-zoom -> vss_00000029."""
+        """Device serial: whatever is typed in the Serial field, else the bag name.
+
+        The field is filled in automatically when the bag path carries a serial
+        (vss_00000029-zoom -> vss_00000029), so typing is only needed for bags
+        named some other way.
+        """
+        typed = getattr(self, "serial_input", None)
+        if typed is not None and typed.text().strip():
+            return self._normalize_serial(typed.text())
+        return self._serial_from_bag_name()
+
+    def _serial_from_bag_name(self) -> str:
         match = re.search(r"vss_\d+", self.bag_file or "")
         return match.group(0) if match else ""
+
+    @staticmethod
+    def _normalize_serial(serial: str) -> str:
+        """Accept 'vss_00000041', '00000041' or '41' -> 'vss_00000041'."""
+        text = serial.strip()
+        return f"vss_{int(text):08d}" if text.isdigit() else text
+
+    def _on_serial_edited(self):
+        """Re-point the device paths at the typed serial."""
+        text = self.serial_input.text().strip()
+        normalized = self._normalize_serial(text) if text else ""
+        if normalized != text:
+            self.serial_input.setText(normalized)
+        self._update_serial_field_state()
+        if self.bag_file:
+            self._auto_load_intrinsics()
+
+    def _update_serial_field_state(self):
+        """Highlight the field when a bag is loaded but no serial is known."""
+        needs_input = bool(self.bag_file) and not self._device_serial
+        self.serial_input.setStyleSheet(
+            "QLineEdit { background: #5a1010; color: #ff9999; }" if needs_input else ""
+        )
+        self.serial_input.setPlaceholderText(
+            "serial needed" if needs_input else "vss_00000041"
+        )
 
     @property
     def _transform_key(self) -> str:
@@ -303,6 +340,17 @@ class MainWindow(QMainWindow):
         self.bag_path_label.setStyleSheet("color: #666; font-style: italic; padding: 0 8px;")
         self.bag_path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         row1.addWidget(self.bag_path_label, 1)
+
+        row1.addWidget(QLabel("Serial:"))
+        self.serial_input = QLineEdit()
+        self.serial_input.setFixedWidth(150)
+        self.serial_input.setPlaceholderText("vss_00000041")
+        self.serial_input.setToolTip(
+            "Device serial for devices/<serial>/. Filled in from the bag name when it\n"
+            "contains one; type it here when it does not."
+        )
+        self.serial_input.editingFinished.connect(self._on_serial_edited)
+        row1.addWidget(self.serial_input)
 
         row1.addSpacing(16)
 
@@ -729,6 +777,12 @@ class MainWindow(QMainWindow):
             self.bag_path_label.setStyleSheet("color: #ccc; padding: 0 8px;")
             self.topics = get_topic_info(file_path, ROS_DISTRO)
             self.topic_types = {t: m for t, m, _ in self.topics}
+            # A serial in the new bag name replaces whatever the field held; a bag
+            # without one leaves a manually typed serial in place.
+            from_name = self._serial_from_bag_name()
+            if from_name:
+                self.serial_input.setText(from_name)
+            self._update_serial_field_state()
             self.update_topic_widgets()
             # The serial is known as soon as the bag path is: load this device's
             # intrinsics now rather than waiting for the bag to be processed.
@@ -1381,10 +1435,12 @@ class MainWindow(QMainWindow):
         key = self._transform_key
 
         if not self._device_serial:
+            self.serial_input.setFocus()
             QMessageBox.information(
-                self, "Device serial not found",
-                "No vss_XXXXXXXX serial in the loaded bag path, so the device folder "
-                "cannot be derived. Pick where to save instead.",
+                self, "Device serial not set",
+                "No serial in the bag name and none typed in the Serial field, so the "
+                "device folder cannot be derived.\n\nType the serial up top and export "
+                "again, or pick a file to save into now.",
             )
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save Extrinsics (merges into the chosen file)",

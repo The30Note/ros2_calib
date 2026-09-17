@@ -115,6 +115,12 @@ Then, in the app:
    the same way.
 6. Export the result to a YAML transform file.
 
+The **Serial** field in the top bar decides which `devices/<serial>/` folder is
+read and written. It fills in from the bag name when that carries a `vss_XXXXXXXX`
+serial, turns red when a bag is loaded and no serial is known, and accepts a typed
+one (`41` and `00000041` expand to `vss_00000041`). A typed serial overrides the
+bag name until a bag whose name carries one is loaded.
+
 Intrinsics are auto-loaded in this order: the device's own calibration at
 `devices/<serial>/ip_camera_processing_cpp/<camera>_camera_info.yaml` (serial read
 from the bag name), then the bag's `CameraInfo` topic, then the packaged default
