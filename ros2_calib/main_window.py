@@ -22,6 +22,7 @@
 
 import datetime
 import os
+import re
 from typing import Dict, List, Optional
 
 import yaml
@@ -75,6 +76,28 @@ from .tf_graph_widget import TFGraphWidget
 
 MAX_RENDER_POINTS = 500_000
 VOXEL_SIZE_INIT   = 0.01    # metres — default starting voxel size for density equalisation
+
+
+# ── Device-config output layout ──────────────────────────────────────────────
+# Mirrors ~/dockware/vision-config/devices/<serial>/ so an exported folder can be
+# copied straight into the vision-config tree.
+DEVICES_DIRNAME        = "devices"
+SPATIAL_SUBDIR         = "spatial_processing"
+CAMERA_SUBDIR          = "ip_camera_processing_cpp"
+STATIC_TRANSFORMS_NAME = "static_transforms.yaml"
+
+# Bag typestore. Was a UI combo; every bag we record comes off the same distro,
+# so it is fixed here instead of being a per-run choice.
+ROS_DISTRO = "HUMBLE"
+
+# Sensor topics are identical on every device, so they are shown but not editable.
+POINTCLOUD_TOPIC = "/livox/lidar"
+CAMERA_TOPICS = {
+    "context": {"image": "/context_camera/main",
+                "camerainfo": "/context_camera/camera_info"},
+    "zoom":    {"image": "/zoom_camera/main",
+                "camerainfo": "/zoom_camera/camera_info"},
+}
 
 
 class MainWindow(QMainWindow):
@@ -194,6 +217,67 @@ class MainWindow(QMainWindow):
     def _parent_frame(self) -> str:
         return "livox_frame"
 
+    @property
+    def _device_serial(self) -> str:
+        """Serial parsed from the loaded bag path, e.g. vss_00000029-zoom -> vss_00000029."""
+        match = re.search(r"vss_\d+", self.bag_file or "")
+        return match.group(0) if match else ""
+
+    @property
+    def _transform_key(self) -> str:
+        """Top-level key this calibration owns inside static_transforms.yaml."""
+        return (f"livox_to_{self._camera_type_label}" if self._is_lidar_cam
+                else "lidar_to_lidar")
+
+    @property
+    def _topics(self) -> Dict[str, str]:
+        """Fixed topic names for the selected camera."""
+        cam = CAMERA_TOPICS.get(self._camera_type_label, {})
+        return {
+            "image_topic":      cam.get("image", ""),
+            "pointcloud_topic": POINTCLOUD_TOPIC,
+            "camerainfo_topic": cam.get("camerainfo", ""),
+        }
+
+    @property
+    def _repo_root(self) -> str:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @property
+    def _device_dir(self) -> str:
+        """devices/<serial>/ in the repo tree that mirrors the device config."""
+        serial = self._device_serial or "unknown_device"
+        return os.path.join(self._repo_root, DEVICES_DIRNAME, serial)
+
+    def _start_dir(self, *preferred: str) -> str:
+        """Starting folder for a file dialog.
+
+        First existing of `preferred` (usually this device's config folder), then
+        bags/, then the repo root — never the process cwd, which is wherever the
+        app happened to be launched from.
+        """
+        for d in (*preferred, os.path.join(self._repo_root, "bags"), self._repo_root):
+            if d and os.path.isdir(d):
+                return d
+        return self._repo_root
+
+    @property
+    def _static_transforms_path(self) -> str:
+        """devices/<serial>/spatial_processing/static_transforms.yaml"""
+        return os.path.join(self._device_dir, SPATIAL_SUBDIR, STATIC_TRANSFORMS_NAME)
+
+    @property
+    def _device_camera_info_path(self) -> str:
+        """devices/<serial>/ip_camera_processing_cpp/<camera>_camera_info.yaml
+
+        Empty string when the bag name carries no serial or the calibration type
+        is not a camera one; the file itself may still not exist.
+        """
+        if not self._device_serial or not self._camera_type_label:
+            return ""
+        return os.path.join(self._device_dir, CAMERA_SUBDIR,
+                            f"{self._camera_type_label}_camera_info.yaml")
+
     # ================================================================== #
     #  Layout builders                                                     #
     # ================================================================== #
@@ -259,36 +343,11 @@ class MainWindow(QMainWindow):
         # ── Row 2: topic selection ─────────────────────────────────────
         row2 = QHBoxLayout()
 
-        self.ros_version_combo = QComboBox()
-        self.ros_version_combo.addItems(["HUMBLE", "JAZZY"])
-        self.ros_version_combo.setFixedWidth(90)
-        row2.addWidget(QLabel("ROS:"))
-        row2.addWidget(self.ros_version_combo)
+        self.topics_label = QLabel()
+        self.topics_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.topics_label.setToolTip("Topic names are fixed for these sensors")
+        row2.addWidget(self.topics_label, 1)
         row2.addSpacing(8)
-
-        self._image_label = QLabel("Image:")
-        self.image_topic_combo = QComboBox()
-        self.image_topic_combo.setEditable(True)
-        self.image_topic_combo.setMinimumWidth(180)
-        self.image_topic_combo.currentTextChanged.connect(self._on_topic_changed)
-        row2.addWidget(self._image_label)
-        row2.addWidget(self.image_topic_combo, 1)
-
-        self._pc_label = QLabel("PointCloud:")
-        self.pointcloud_topic_combo = QComboBox()
-        self.pointcloud_topic_combo.setEditable(True)
-        self.pointcloud_topic_combo.setMinimumWidth(180)
-        self.pointcloud_topic_combo.currentTextChanged.connect(self._on_topic_changed)
-        row2.addWidget(self._pc_label)
-        row2.addWidget(self.pointcloud_topic_combo, 1)
-
-        self._info_label = QLabel("CamInfo:")
-        self.camerainfo_topic_combo = QComboBox()
-        self.camerainfo_topic_combo.setEditable(True)
-        self.camerainfo_topic_combo.setMinimumWidth(180)
-        self.camerainfo_topic_combo.currentTextChanged.connect(self._on_topic_changed)
-        row2.addWidget(self._info_label)
-        row2.addWidget(self.camerainfo_topic_combo, 1)
 
         self._frames_label = QLabel("Frames:")
         self.frame_samples_spinbox = QSpinBox()
@@ -344,8 +403,7 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(row2)
 
-        # Initial visibility for L2L vs cam2lidar
-        self._update_topic_visibility()
+        self._validate_all_topics()
         return bar
 
     def _build_middle_row(self) -> QFrame:
@@ -379,19 +437,28 @@ class MainWindow(QMainWindow):
         left.setSpacing(4)
 
         src_row = QHBoxLayout()
+        self.intrinsics_device_btn = QPushButton("Device File")
+        self.intrinsics_device_btn.setToolTip(
+            "Load devices/<serial>/ip_camera_processing_cpp/<camera>_camera_info.yaml "
+            "for the serial in the loaded bag name"
+        )
+        # lambda: clicked() would pass its checked=False into `quiet`
+        self.intrinsics_device_btn.clicked.connect(lambda: self._load_device_intrinsics())
         self.intrinsics_default_btn = QPushButton("Default File")
         self.intrinsics_default_btn.clicked.connect(self._load_default_intrinsics)
         self.intrinsics_file_btn = QPushButton("Load File…")
         self.intrinsics_file_btn.clicked.connect(self._browse_intrinsics_file)
         self.intrinsics_rosbag_btn = QPushButton("ROS Topic")
         self.intrinsics_rosbag_btn.clicked.connect(self._use_rosbag_intrinsics)
-        for b in (self.intrinsics_default_btn, self.intrinsics_file_btn,
-                  self.intrinsics_rosbag_btn):
+        for b in (self.intrinsics_device_btn, self.intrinsics_default_btn,
+                  self.intrinsics_file_btn, self.intrinsics_rosbag_btn):
             src_row.addWidget(b)
         src_row.addStretch()
         left.addLayout(src_row)
 
         self.intrinsics_source_label = QLabel()
+        self.intrinsics_source_label.setWordWrap(True)
+        self.intrinsics_source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.intrinsics_source_label.setStyleSheet(
             "color: #888; font-style: italic; font-size: 11px;"
         )
@@ -568,7 +635,11 @@ class MainWindow(QMainWindow):
         self.transform_yaml_display.setFontFamily("monospace")
         self.transform_yaml_display.setFontPointSize(9)
         right.addWidget(self.transform_yaml_display, stretch=1)
-        self.extrinsics_export_btn = QPushButton("Export…")
+        self.extrinsics_export_btn = QPushButton("Export to Device")
+        self.extrinsics_export_btn.setToolTip(
+            "Write this transform into devices/<serial>/spatial_processing/"
+            "static_transforms.yaml, editing the file in place"
+        )
         self.extrinsics_export_btn.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
         self.extrinsics_export_btn.clicked.connect(self._export_extrinsics)
         right.addWidget(self.extrinsics_export_btn)
@@ -602,21 +673,19 @@ class MainWindow(QMainWindow):
             self.calibration_type = "LiDAR2Cam_Zoom"
             self.btn_zoom.setStyleSheet(_sub_active)
             self.btn_context.setStyleSheet(_sub_inactive)
+        self._validate_all_topics()
         if self.bag_file:
-            self._auto_select_topics()
-            self._validate_all_topics()
-
-    def _update_topic_visibility(self):
-        pass  # always cam2lidar — all topic fields are always visible
+            # Topics and the device intrinsics file both differ per camera.
+            self._auto_load_intrinsics()
 
     # ================================================================== #
     #  Bag loading                                                         #
     # ================================================================== #
 
     def load_bag(self):
-        bags_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bags")
-        start_dir = bags_dir if os.path.isdir(bags_dir) else os.path.expanduser("~")
-        path, _ = QFileDialog.getOpenFileName(self, "Open Rosbag", start_dir, "MCAP Rosbag (*.mcap)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Rosbag", self._start_dir(), "MCAP Rosbag (*.mcap)"
+        )
         if path:
             self.load_bag_from_path(path)
 
@@ -654,92 +723,40 @@ class MainWindow(QMainWindow):
             self.bag_file = file_path
             self.bag_path_label.setText(os.path.basename(file_path))
             self.bag_path_label.setStyleSheet("color: #ccc; padding: 0 8px;")
-            ros_version = self.ros_version_combo.currentText()
-            self.topics = get_topic_info(file_path, ros_version)
+            self.topics = get_topic_info(file_path, ROS_DISTRO)
             self.topic_types = {t: m for t, m, _ in self.topics}
             self.update_topic_widgets()
+            # The serial is known as soon as the bag path is: load this device's
+            # intrinsics now rather than waiting for the bag to be processed.
+            self._auto_load_intrinsics()
         except Exception as e:
             self.bag_path_label.setText(f"Error: {e}")
             self.bag_path_label.setStyleSheet("color: #f44; padding: 0 8px;")
 
     def update_topic_widgets(self):
-        image_topics = [
-            t for t, m, _ in self.topics
-            if m in ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")
-        ]
-        pc_topics = [t for t, m, _ in self.topics if m == "sensor_msgs/msg/PointCloud2"]
-        info_topics = [t for t, m, _ in self.topics if m == "sensor_msgs/msg/CameraInfo"]
-
-        for combo, items in [
-            (self.image_topic_combo, image_topics),
-            (self.pointcloud_topic_combo, pc_topics),
-            (self.camerainfo_topic_combo, info_topics),
-        ]:
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(items)
-            combo.blockSignals(False)
-
-        self._auto_select_topics()
         self._validate_all_topics()
 
-    def _auto_select_topics(self):
-        preferred = {
-            "LiDAR2Cam_Context": {
-                "image": "/context_camera/main",
-                "camerainfo": "/context_camera/camera_info",
-                "pointcloud": "/livox/lidar",
-            },
-            "LiDAR2Cam_Zoom": {
-                "image": "/zoom_camera/main",
-                "camerainfo": "/zoom_camera/camera_info",
-                "pointcloud": "/livox/lidar",
-            },
-        }.get(self.calibration_type, {})
-
-        available = {t for t, _, _ in self.topics}
-
-        def _try_set(combo, topic):
-            if topic in available:
-                combo.blockSignals(True)
-                combo.setCurrentText(topic)
-                combo.blockSignals(False)
-
-        _try_set(self.pointcloud_topic_combo, preferred.get("pointcloud", ""))
-        _try_set(self.image_topic_combo, preferred.get("image", ""))
-        _try_set(self.camerainfo_topic_combo, preferred.get("camerainfo", ""))
-
     def _validate_all_topics(self):
+        """Show the fixed topics, flagging any the loaded bag does not contain."""
         available = {t for t, _, _ in self.topics}
-        for combo in (self.image_topic_combo, self.pointcloud_topic_combo,
-                      self.camerainfo_topic_combo):
-            self._set_topic_state(combo, combo.currentText(), available)
+        parts, missing = [], False
+        for label, topic in (("Image", self._topics["image_topic"]),
+                             ("PointCloud", self._topics["pointcloud_topic"]),
+                             ("CamInfo", self._topics["camerainfo_topic"])):
+            ok = topic in available
+            missing = missing or (not ok and label != "CamInfo")
+            mark = "" if ok or not self.bag_file else "  ✗ missing"
+            parts.append(f"{label}: {topic}{mark}")
+        self.topics_label.setText("   ".join(parts))
+        self.topics_label.setStyleSheet(
+            f"color: {'#ff9999' if missing and self.bag_file else '#888'}; font-size: 11px;"
+        )
         self._update_process_button_state()
-
-    def _set_topic_state(self, combo: "QComboBox", topic: str, available: set):
-        if topic and topic not in available:
-            combo.lineEdit().setPlaceholderText("Topic does not exist")
-            combo.setStyleSheet(
-                "QComboBox { background: #5a1010; color: #ff9999; }"
-                "QComboBox QAbstractItemView { background: #2a2a2a; color: #ccc; }"
-            )
-            combo.blockSignals(True)
-            combo.setCurrentText("")
-            combo.blockSignals(False)
-        else:
-            combo.lineEdit().setPlaceholderText("")
-            combo.setStyleSheet("")
-
-    def _on_topic_changed(self):
-        if self.bag_file:
-            self._validate_all_topics()
 
     def _update_process_button_state(self):
         available = {t for t, _, _ in self.topics}
-        ok = (
-            self.image_topic_combo.currentText() in available
-            and self.pointcloud_topic_combo.currentText() in available
-        )
+        ok = (self._topics["image_topic"] in available
+              and self._topics["pointcloud_topic"] in available)
         self.process_button.setEnabled(ok)
 
     # ================================================================== #
@@ -758,9 +775,7 @@ class MainWindow(QMainWindow):
 
         selected_topics_data = {
             "calibration_type": self.calibration_type,
-            "image_topic": self.image_topic_combo.currentText(),
-            "pointcloud_topic": self.pointcloud_topic_combo.currentText(),
-            "camerainfo_topic": self.camerainfo_topic_combo.currentText(),
+            **self._topics,
             "tf_topics": tf_topics,
         }
 
@@ -776,12 +791,10 @@ class MainWindow(QMainWindow):
             bag_file=self.bag_file,
             topics_to_read=topics_to_read,
             selected_topics_data=selected_topics_data,
-            total_messages=get_total_message_count(
-                self.bag_file, self.ros_version_combo.currentText()
-            ),
+            total_messages=get_total_message_count(self.bag_file, ROS_DISTRO),
             frame_samples=self.frame_samples_spinbox.value(),   # max synchronised pairs to read
             topic_message_counts={n: c for n, _, c in self.topics},
-            ros_version=self.ros_version_combo.currentText(),
+            ros_version=ROS_DISTRO,
             sync_tolerance=0.05,
         )
         self.processing_worker.progress_updated.connect(self.update_processing_progress)
@@ -850,7 +863,7 @@ class MainWindow(QMainWindow):
             else self._child_frame
         )
 
-        # Auto-load intrinsics (rosbag topic → default file)
+        # Auto-load intrinsics (device file → rosbag topic → packaged default)
         self._auto_load_intrinsics()
 
         # Auto-load extrinsics (TF static → default file)
@@ -965,7 +978,15 @@ class MainWindow(QMainWindow):
     # ================================================================== #
 
     def _auto_load_intrinsics(self):
-        """Try rosbag CameraInfo topic first, then fall back to default file."""
+        """Prefer this device's calibrated intrinsics, then the bag's CameraInfo
+        topic, then the packaged default file.
+
+        The device file is what calibrate.py wrote for this exact unit, so it
+        beats the CameraInfo the bag was recorded with (which is often stale or
+        a factory default).
+        """
+        if self._load_device_intrinsics(quiet=True):
+            return
         info_topic = self.selected_topics_data.get("camerainfo_topic", "")
         if info_topic and info_topic in self.frame_samples:
             try:
@@ -981,13 +1002,46 @@ class MainWindow(QMainWindow):
                 pass
         self._load_default_intrinsics()
 
+    def _display_path(self, path: str) -> str:
+        """Path relative to the repo root when it lives there, else absolute."""
+        try:
+            rel = os.path.relpath(path, self._repo_root)
+        except ValueError:
+            return path
+        return path if rel.startswith("..") else rel
+
+    def _load_device_intrinsics(self, quiet: bool = False) -> bool:
+        """Load devices/<serial>/.../<camera>_camera_info.yaml if it exists."""
+        path = self._device_camera_info_path
+        if not path or not os.path.exists(path):
+            if not quiet:
+                serial = self._device_serial
+                reason = ("No serial in the bag name, so the device folder is unknown."
+                          if not serial else f"Not found:\n{path}")
+                QMessageBox.information(self, "No device intrinsics", reason)
+            return False
+        try:
+            self.active_camerainfo_msg = self._parse_camera_info_yaml(path)
+        except Exception as e:
+            if not quiet:
+                QMessageBox.warning(self, "Load Error", str(e))
+            else:
+                print(f"[WARN] Could not parse device intrinsics {path}: {e}")
+            return False
+        self.intrinsics_source_label.setText(f"Source: {self._display_path(path)}")
+        self.intrinsics_source_label.setToolTip(path)
+        self._refresh_intrinsics_display()
+        self._on_intrinsics_loaded()
+        return True
+
     def _load_default_intrinsics(self):
         data_dir = os.path.join(os.path.dirname(__file__), "data")
         path = os.path.join(data_dir, f"{self._camera_type_label}_intrinsics.yaml")
         if os.path.exists(path):
             try:
                 self.active_camerainfo_msg = self._parse_camera_info_yaml(path)
-                self.intrinsics_source_label.setText(f"Source: {os.path.basename(path)}")
+                self.intrinsics_source_label.setText(f"Source: {self._display_path(path)}")
+                self.intrinsics_source_label.setToolTip(path)
                 self._refresh_intrinsics_display()
                 self._on_intrinsics_loaded()
             except Exception as e:
@@ -997,12 +1051,15 @@ class MainWindow(QMainWindow):
 
     def _browse_intrinsics_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Camera Intrinsics", "", "YAML Files (*.yaml *.yml)"
+            self, "Load Camera Intrinsics",
+            self._start_dir(os.path.join(self._device_dir, CAMERA_SUBDIR)),
+            "YAML Files (*.yaml *.yml)",
         )
         if path:
             try:
                 self.active_camerainfo_msg = self._parse_camera_info_yaml(path)
-                self.intrinsics_source_label.setText(f"Source: {path}")
+                self.intrinsics_source_label.setText(f"Source: {self._display_path(path)}")
+                self.intrinsics_source_label.setToolTip(path)
                 self._refresh_intrinsics_display()
                 self._on_intrinsics_loaded()
             except Exception as e:
@@ -1120,7 +1177,9 @@ class MainWindow(QMainWindow):
 
     def _browse_extrinsics_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Extrinsics", "", "YAML Files (*.yaml *.yml)"
+            self, "Load Extrinsics",
+            self._start_dir(os.path.join(self._device_dir, SPATIAL_SUBDIR)),
+            "YAML Files (*.yaml *.yml)",
         )
         if path:
             try:
@@ -1269,7 +1328,7 @@ class MainWindow(QMainWindow):
         T = self.current_transform
         trans = tf.translation_from_matrix(T)
         q = tf.quaternion_from_matrix(T)  # [x, y, z, w]
-        key = f"livox_to_{self._camera_type_label}" if self._is_lidar_cam else "lidar_to_lidar"
+        key = self._transform_key
         parent = self._parent_frame
         child = self._child_frame
         text = (
@@ -1298,10 +1357,57 @@ class MainWindow(QMainWindow):
             self.calib_widget.update_extrinsics(self.current_transform)
 
     def _export_extrinsics(self):
-        default = f"livox_to_{self._camera_type_label}.yaml"
-        path, _ = QFileDialog.getSaveFileName(self, "Save Extrinsics", default, "YAML (*.yaml)")
-        if path:
+        """Write this transform into the device's static_transforms.yaml.
+
+        No save dialog: the destination is derived from the bag serial and the
+        file is edited in place, so re-exporting only ever rewrites this
+        calibration's own key. A dialog appears only when the serial is unknown
+        and there is nothing to derive the path from.
+        """
+        path = self._static_transforms_path
+        key = self._transform_key
+
+        if not self._device_serial:
+            QMessageBox.information(
+                self, "Device serial not found",
+                "No vss_XXXXXXXX serial in the loaded bag path, so the device folder "
+                "cannot be derived. Pick where to save instead.",
+            )
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Extrinsics (merges into the chosen file)",
+                path, "YAML (*.yaml)",
+            )
+            if not path:
+                return
+
+        updated = False
+        if os.path.exists(path):
+            with open(path) as f:
+                updated = any(line.startswith(f"{key}:") for line in f)
+
+        if updated:
+            reply = QMessageBox.question(
+                self, "Overwrite existing transform?",
+                f"{key} is already in:\n{self._display_path(path)}\n\n"
+                "Overwrite it with the current calibration?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
             self._write_calib_yaml(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+
+        verb = "Overwrote" if updated else "Added"
+        QMessageBox.information(
+            self, "Extrinsics exported",
+            f"{verb} {key} in:\n{self._display_path(path)}\n\n"
+            "Every other transform in the file was left untouched.",
+        )
 
     # ================================================================== #
     #  TF tree                                                            #
@@ -1437,10 +1543,13 @@ class MainWindow(QMainWindow):
             self._view_placeholder.deleteLater()
             self._view_placeholder = None
 
-        cinfo = self.active_camerainfo_msg or self._parse_camera_info_yaml(
-            os.path.join(os.path.dirname(__file__), "data",
-                         f"{self._camera_type_label}_intrinsics.yaml")
-        )
+        cinfo = self.active_camerainfo_msg
+        if cinfo is None:
+            device_path = self._device_camera_info_path
+            fallback = (device_path if device_path and os.path.exists(device_path)
+                        else os.path.join(os.path.dirname(__file__), "data",
+                                          f"{self._camera_type_label}_intrinsics.yaml"))
+            cinfo = self._parse_camera_info_yaml(fallback)
         self.calib_widget = CalibrationWidget(
             image_msg, pointcloud_msg, cinfo, ros_utils, self.current_transform
         )
@@ -1512,7 +1621,7 @@ class MainWindow(QMainWindow):
         T = self.current_transform
         t = T[:3, 3]
         q = Rotation.from_matrix(T[:3, :3]).as_quat()  # [x, y, z, w]
-        key = f"livox_to_{self._camera_type_label}" if self._is_lidar_cam else "lidar_to_lidar"
+        key = self._transform_key
         timestamp = datetime.date.today().isoformat()
         content = (
             f"{key}:\n"
@@ -1531,8 +1640,63 @@ class MainWindow(QMainWindow):
             f"    source_file: ros2_calib\n"
             f"    conversion_timestamp: '{timestamp}'\n"
         )
+        self._merge_into_yaml(file_path, key, content)
+
+    @staticmethod
+    def _merge_into_yaml(file_path: str, key: str, block: str):
+        """Write `block` into `file_path`, replacing only the top-level `key`.
+
+        static_transforms.yaml holds every transform for the device, so exporting
+        the zoom calibration must leave livox_to_context (and anything else)
+        untouched. The merge is textual rather than a yaml round-trip so the other
+        entries keep their exact formatting and comments.
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+
+        existing = ""
+        if os.path.exists(file_path):
+            with open(file_path) as f:
+                existing = f.read()
+
+        kept, skipping = [], False
+        for line in existing.splitlines(keepends=True):
+            if re.match(r"^\S+:", line):                 # start of a top-level entry
+                skipping = line.split(":", 1)[0] == key
+            if not skipping:
+                kept.append(line)
+
+        out = "".join(kept)
+        if out and not out.endswith("\n"):
+            out += "\n"
         with open(file_path, "w") as f:
-            f.write(content)
+            f.write(out + block)
+
+    # ================================================================== #
+    #  Shutdown                                                            #
+    # ================================================================== #
+
+    def shutdown(self):
+        """Stop background work so the process can exit without being killed.
+
+        Called from closeEvent and from the SIGINT handler in main.py. Safe to
+        call twice.
+        """
+        worker = getattr(self, "processing_worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    worker.requestInterruption()   # polled by the bag reader loop
+                    worker.quit()
+                    if not worker.wait(3000):
+                        worker.terminate()
+                        worker.wait(1000)
+            except RuntimeError:
+                pass    # already deleted by Qt
+            self.processing_worker = None
+
+    def closeEvent(self, event):
+        self.shutdown()
+        event.accept()
 
     # ================================================================== #
     #  Drag & drop                                                         #

@@ -112,11 +112,15 @@ cd ros2_calib
 
 # Create a virtual environment
 python -m venv .venv
-source ./venv/bin/activate
+source .venv/bin/activate
 
 # Install in development mode
-python -m pip install .
+python -m pip install -e .
 ```
+
+See [SETUP.md](SETUP.md) for full bring-up instructions on a fresh machine,
+including the system Qt/OpenGL libraries the GUI needs and how to run
+`calibrate.py` and `capture_bag.sh`.
 
 ## Quick Start
 

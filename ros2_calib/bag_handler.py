@@ -21,9 +21,13 @@
 # SOFTWARE.
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QThread, Signal
+
+
+class Cancelled(Exception):
+    """Raised inside a reader loop when the caller asked it to stop."""
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
@@ -201,8 +205,13 @@ def read_synchronized_image_cloud(
     max_time_diff: float = 0.05,
     frame_samples: int = 6,
     ros_version: str = "JAZZY",
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict:
-    """Synchronize image, point cloud, and camera info by nearest timestamp."""
+    """Synchronize image, point cloud, and camera info by nearest timestamp.
+
+    `should_cancel` is polled while reading so the app can shut down without
+    waiting for a large bag to finish.
+    """
     ros_store = getattr(Stores, f"ROS2_{ros_version}")
     typestore = get_typestore(ros_store)
 
@@ -272,6 +281,8 @@ def read_synchronized_image_cloud(
             progress_callback.emit(10, "Synchronizing image and point cloud...")
 
         while img_state and pc_state and len(pairs) < frame_samples:
+            if should_cancel is not None and should_cancel():
+                raise Cancelled()
             _, t_img, raw_img = img_state
             _, t_pc, raw_pc = pc_state
             diff = abs(t_img - t_pc)
@@ -511,11 +522,15 @@ class RosbagProcessingWorker(QThread):
                     max_time_diff=self.sync_tolerance,
                     frame_samples=self.frame_samples,
                     ros_version=self.ros_version,
+                    should_cancel=self.isInterruptionRequested,
                 )
 
             self.progress_updated.emit(95, "Finalizing data...")
             topic_types = {name: type_str for name, type_str in self.topics_to_read.items()}
             self.processing_finished.emit(raw_messages, topic_types, self.selected_topics_data)
+
+        except Cancelled:
+            pass    # app is shutting down; nothing to report
 
         except Exception as e:
             import traceback

@@ -538,16 +538,6 @@ class CalibrationWidget(QWidget):
         )
         view_form.addRow("Color Mode:", self.colorization_mode_combo)
 
-        self.min_value_spinbox = QDoubleSpinBox()
-        self.min_value_spinbox.setRange(-1e9, 1e9)
-        self.min_value_spinbox.setDecimals(2)
-        view_form.addRow("Min:", self.min_value_spinbox)
-
-        self.max_value_spinbox = QDoubleSpinBox()
-        self.max_value_spinbox.setRange(-1e9, 1e9)
-        self.max_value_spinbox.setDecimals(2)
-        view_form.addRow("Max:", self.max_value_spinbox)
-
         # Surface-normals controls (hidden by default)
         self._normal_extra_labels = []
         self.normal_neighbors_spinbox = QSpinBox()
@@ -679,8 +669,6 @@ class CalibrationWidget(QWidget):
         for sb in self._normal_rot_spinboxes:
             sb.valueChanged.connect(self._on_view_params_changed)
         self.normal_neighbors_spinbox.valueChanged.connect(self._on_view_params_changed)
-        self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
-        self.max_value_spinbox.valueChanged.connect(self._on_view_params_changed)
 
         return scroll
 
@@ -745,43 +733,28 @@ class CalibrationWidget(QWidget):
         self._set_normal_rotation_visible(
             self.colorization_mode_combo.currentText() == "Surface Normals"
         )
-        self._update_min_max_values_for_mode()
         self.redraw_points()
 
-    def _update_min_max_values_for_mode(self):
-        """Update min/max spinbox values based on current colorization mode."""
-        if not hasattr(self, "points_xyz") or self.points_xyz.shape[0] == 0:
-            return
+    # Colour-scale range per mode, as quantiles of the values being coloured.
+    # These are exactly what the old Min/Max spinboxes were seeded with; the
+    # scale is now recomputed from the data on every redraw instead of being
+    # editable. Quantiles rather than literal min/max so one retroreflector or
+    # one stray far return cannot flatten the whole gradient.
+    _COLOR_RANGE_QUANTILES = {
+        "Distance":   (0.01, 0.99),
+        "LiDAR Edge": (0.00, 0.95),
+        "Intensity":  (0.01, 0.90),
+    }
 
-        colorization_mode = self.colorization_mode_combo.currentText()
-        if colorization_mode == "Distance":
-            if hasattr(self, "valid_indices") and len(self.valid_indices) > 0:
-                tvec = self.extrinsics[:3, 3]
-                points_cam = (self.extrinsics[:3, :3] @ self.points_xyz.T).T + tvec
-                valid_points_cam = points_cam[self.valid_indices]
-                distances = np.linalg.norm(valid_points_cam, axis=1)
-                min_dist, max_dist = np.quantile(distances, [0.01, 0.99])
-                self.min_value_spinbox.setValue(min_dist)
-                self.max_value_spinbox.setValue(max_dist)
-        elif colorization_mode == "LiDAR Edge":
-            if hasattr(self, "valid_indices") and len(self.valid_indices) > 0 and hasattr(self, "points_proj_valid"):
-                tvec = self.extrinsics[:3, 3]
-                pts_cam = (self.extrinsics[:3, :3] @ self.points_xyz[self.valid_indices].T).T + tvec
-                scores = self._compute_lidar_edge_scores(pts_cam, self.points_proj_valid)
-                self.min_value_spinbox.setValue(0.0)
-                self.max_value_spinbox.setValue(float(np.quantile(scores, 0.95)))
-        elif colorization_mode == "Surface Normals":
-            # No scalar range needed — RGB mapped directly from normal vector
-            self.min_value_spinbox.setEnabled(False)
-            self.max_value_spinbox.setEnabled(False)
-            return
-        else:
-            if hasattr(self, "intensities") and self.intensities.size > 0:
-                min_i, max_i = np.quantile(self.intensities, [0.01, 0.90])
-                self.min_value_spinbox.setValue(min_i)
-                self.max_value_spinbox.setValue(max_i)
-        self.min_value_spinbox.setEnabled(True)
-        self.max_value_spinbox.setEnabled(True)
+    def _color_range(self, values: np.ndarray, mode: str) -> tuple:
+        """Auto colour-scale range for `values` in the given colorization mode."""
+        if values.size == 0:
+            return 0.0, 1.0
+        lo_q, hi_q = self._COLOR_RANGE_QUANTILES.get(mode, (0.01, 0.90))
+        lo, hi = np.quantile(values, [lo_q, hi_q])
+        if mode == "LiDAR Edge":
+            lo = 0.0          # edge scores are magnitudes; always start the ramp at 0
+        return float(lo), float(hi)
 
     def _compute_lidar_edge_scores(
         self, pts_cam: np.ndarray, pts_2d: np.ndarray, k: int = 10
@@ -1317,10 +1290,6 @@ class CalibrationWidget(QWidget):
             self.points_xyz = np.vstack([cloud_arr["x"], cloud_arr["y"], cloud_arr["z"]]).T
             intensity_field = "intensity" if "intensity" in cloud_arr.dtype.names else "reflectivity"
             self.intensities = cloud_arr[intensity_field].astype(np.float32)
-            if self.intensities.size > 0:
-                # Set initial min/max values based on current colorization mode
-                self._update_min_max_values_for_mode()
-
         if not hasattr(self, "points_xyz") or self.points_xyz.shape[0] == 0:
             return
 
@@ -1381,13 +1350,13 @@ class CalibrationWidget(QWidget):
         if colorization_mode == "Distance":
             valid_points_cam = points_cam[self.valid_indices]
             distances = np.linalg.norm(valid_points_cam, axis=1)
-            min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
+            min_val, max_val = self._color_range(distances, "Distance")
             norm_values = np.clip((distances - min_val) / (max_val - min_val + 1e-6), 0, 1)
             colors = cmap(norm_values)
         elif colorization_mode == "LiDAR Edge":
             valid_points_cam = points_cam[self.valid_indices]
             scores = self._compute_lidar_edge_scores(valid_points_cam, self.points_proj_valid)
-            min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
+            min_val, max_val = self._color_range(scores, "LiDAR Edge")
             norm_values = np.clip((scores - min_val) / (max_val - min_val + 1e-6), 0, 1)
             colors = cmap(norm_values)
         elif colorization_mode == "Surface Normals":
@@ -1407,7 +1376,7 @@ class CalibrationWidget(QWidget):
             colors = np.column_stack([rgb, np.ones(len(rgb))])
         else:
             # Intensity (default)
-            min_val, max_val = self.min_value_spinbox.value(), self.max_value_spinbox.value()
+            min_val, max_val = self._color_range(self.intensities_valid, "Intensity")
             norm_values = np.clip(
                 (self.intensities_valid - min_val) / (max_val - min_val + 1e-6), 0, 1
             )

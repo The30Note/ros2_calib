@@ -31,15 +31,24 @@ from .main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
+    window = MainWindow()
 
-    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    def _shutdown(*_):
+        """Stop background threads, then let the event loop return."""
+        window.shutdown()
+        app.quit()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _shutdown)
     # Qt blocks the Python signal handler while the event loop is running;
     # a short timer lets Python check for signals periodically.
     timer = QTimer()
     timer.start(200)
     timer.timeout.connect(lambda: None)
 
-    window = MainWindow()
+    # Covers Alt+F4 / the window manager's close button as well as quit().
+    app.aboutToQuit.connect(window.shutdown)
+
     window.show()
     sys.exit(app.exec())
 
