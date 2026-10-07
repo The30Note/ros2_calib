@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -272,6 +271,7 @@ class CalibrationWidget(QWidget):
     calibration_completed = Signal(object)   # Signal to emit calibrated transform(s)
     _refinement_done = Signal(object)        # emitted from worker thread with new extrinsics
     extrinsics_updated = Signal(np.ndarray)  # T_lidar_cam after refinement/calibration
+    export_requested = Signal()              # MainWindow writes the device's static_transforms
 
     def __init__(
         self,
@@ -659,7 +659,11 @@ class CalibrationWidget(QWidget):
         refine_sec.add_widget(self.refine_status_label)
         root.addWidget(refine_sec)
 
-        self.export_button = QPushButton("Export Calibration")
+        self.export_button = QPushButton("Export to Device")
+        self.export_button.setToolTip(
+            "Write this transform into devices/<serial>/spatial_processing/"
+            "static_transforms.yaml (same as the Export to Device button up top)"
+        )
         self.export_button.clicked.connect(self.export_calibration)
         root.addWidget(self.export_button)
 
@@ -1752,19 +1756,15 @@ class CalibrationWidget(QWidget):
         self.results_label.setText("Calibration parameters updated")
 
     def export_calibration(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Calibration", "", "YAML Files (*.yaml)"
-        )
-        if file_path:
-            t = self.extrinsics[:3, 3]
-            q = Rotation.from_matrix(self.extrinsics[:3, :3]).as_quat()
-            with open(file_path, "w") as f:
-                f.write("# LiDAR-Camera Extrinsic Calibration (T_camera_lidar)\n")
-                f.write(f"translation:\n  x: {t[0]:.8f}\n  y: {t[1]:.8f}\n  z: {t[2]:.8f}\n")
-                f.write(
-                    f"rotation:\n  x: {q[0]:.8f}\n  y: {q[1]:.8f}\n  z: {q[2]:.8f}\n  w: {q[3]:.8f}\n"
-                )
-            print(f"Calibration saved to {file_path}")
+        """Hand the export to MainWindow so there is a single export path.
+
+        This button used to open its own save dialog (starting in the process
+        cwd) and write the inverse transform, T_camera_lidar, in a different
+        format, reporting success only on the console, so a result "exported"
+        from here never reached the device's static_transforms.yaml.
+        """
+        self.export_button.setStyleSheet(self.default_button_style)
+        self.export_requested.emit()
 
     def view_calibration_results(self):
         """Emit signal to view calibration results in main window."""

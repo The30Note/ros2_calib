@@ -4,21 +4,24 @@
 # with --local (no SSH; uses the local Docker daemon directly).
 #
 # Usage:
-#   ./capture_bag.sh user@server --serial vss_016
-#   ./capture_bag.sh dockware@beyonce --serial vss_016
-#   ./capture_bag.sh dockware@beyonce --serial vss_016 --duration 10
-#   ./capture_bag.sh --local --serial vss_016
-#   ./capture_bag.sh --local --serial vss_016 --duration 10
+#   ./capture_bag.sh --local --name vss_00000045        # vss_calib container -> bags/vss_00000045_calib_<ts>
+#   ./capture_bag.sh dockware@beyonce --name vss_00000045 --duration 10
+#   ./capture_bag.sh dockware@beyonce --serial vss_016  # container and bag both named vss_016
 #
 # Options:
 #   --local                Capture from the local Docker daemon instead of SSHing remotely.
-#   --serial <serial>      Sensor suite serial (e.g. vss_016). vss_ prefix auto-added if missing.
+#   --name <serial>        Device serial the bag is saved as, written out in full as
+#                          vss_ plus 8 digits (e.g. vss_00000045). The GUI reads it from the
+#                          bag name to pick devices/<serial>/. Defaults to the container serial.
+#   --serial <serial>      Serial of the container to record from (default: calib, i.e. the
+#                          vss_calib calibration container). vss_ prefix auto-added if missing.
 #   --duration <seconds>   Recording duration in seconds (default: 3)
 
 set -e
 
 TARGET=""
-SERIAL=""
+SERIAL="calib"
+NAME=""
 DURATION=3
 LOCAL=0
 
@@ -29,6 +32,10 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --serial)
             SERIAL="$2"
+            shift
+            ;;
+        --name)
+            NAME="$2"
             shift
             ;;
         --duration)
@@ -53,8 +60,8 @@ done
 
 if [ "$LOCAL" -eq 0 ] && [ -z "$TARGET" ]; then
     echo "Error: Missing target (user@server). Pass a target or use --local."
-    echo "Usage: $0 user@server --serial <serial> [--duration <seconds>]"
-    echo "       $0 --local --serial <serial> [--duration <seconds>]"
+    echo "Usage: $0 user@server [--name <serial>] [--serial <serial>] [--duration <seconds>]"
+    echo "       $0 --local [--name <serial>] [--serial <serial>] [--duration <seconds>]"
     exit 1
 fi
 
@@ -64,12 +71,17 @@ if [ "$LOCAL" -eq 1 ] && [ -n "$TARGET" ]; then
 fi
 
 if [ -z "$SERIAL" ]; then
-    echo "Error: --serial is required."
+    echo "Error: --serial must not be empty."
     exit 1
 fi
 
 if [[ ! "${SERIAL}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "Security Error: SERIAL '${SERIAL}' contains invalid characters."
+    exit 1
+fi
+
+if [[ -n "${NAME}" && ! "${NAME}" =~ ^vss_[0-9]{8}$ ]]; then
+    echo "Error: --name must be the full serial, vss_ plus 8 digits (e.g. vss_00000045)."
     exit 1
 fi
 
@@ -84,6 +96,11 @@ if [[ ! "$SERIAL" =~ ^(vss_|srv_) ]]; then
     SERIAL="vss_${SERIAL}"
 fi
 
+# Device serial the bag is saved as; without --name the bag is named after the container.
+if [ -z "$NAME" ]; then
+    NAME="$SERIAL"
+fi
+
 # Run a command either on the remote host (over SSH) or locally, depending on --local.
 run_host() {
     if [ "$LOCAL" -eq 1 ]; then
@@ -94,7 +111,7 @@ run_host() {
 }
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BAG_NAME="${SERIAL}_calib_${TIMESTAMP}"
+BAG_NAME="${NAME}_calib_${TIMESTAMP}"
 CONTAINER_BAG_PATH="/tmp/${BAG_NAME}"
 HOST_ARCHIVE="/tmp/${BAG_NAME}.tar.gz"
 LOCAL_ARCHIVE="/tmp/${BAG_NAME}.tar.gz"
@@ -105,7 +122,8 @@ if [ "$LOCAL" -eq 1 ]; then
 else
     echo "Target:    $TARGET"
 fi
-echo "Serial:    $SERIAL"
+echo "Container: $SERIAL"
+echo "Save as:   $NAME"
 echo "Duration:  ${DURATION}s"
 echo "Bag name:  $BAG_NAME"
 echo ""

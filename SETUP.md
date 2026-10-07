@@ -113,13 +113,17 @@ Then, in the app:
    pixel, **left-click** picks (or unpicks) LiDAR points, **right-click** saves it
    with whatever is selected. The Add Correspondence / Confirm buttons still work
    the same way.
-6. Export the result to a YAML transform file.
+6. Export with **Export to Device** (the button in the calibration side panel does
+   the same thing). The success message shows the absolute path written, and is
+   only shown after the transform has been read back from the file.
 
 The **Serial** field in the top bar decides which `devices/<serial>/` folder is
 read and written. It fills in from the bag name when that carries a `vss_XXXXXXXX`
 serial, turns red when a bag is loaded and no serial is known, and accepts a typed
-one (`41` and `00000041` expand to `vss_00000041`). A typed serial overrides the
-bag name until a bag whose name carries one is loaded.
+one (`41`, `00000041` and `vss_41` expand to `vss_00000041`). A typed serial
+overrides the bag name until a bag whose name carries one is loaded. A serial that
+was only auto-filled from the previous bag is cleared when a bag without one is
+loaded, so an export never lands in the previous device's folder.
 
 Intrinsics are auto-loaded in this order: the device's own calibration at
 `devices/<serial>/ip_camera_processing_cpp/<camera>_camera_info.yaml` (serial read
@@ -137,7 +141,8 @@ devices/<serial>/spatial_processing/static_transforms.yaml
 ```
 
 The serial is read from the loaded bag path (`vss_00000029-zoom` → `vss_00000029`);
-if none is found the export falls back to `devices/unknown_device/` and says so.
+if no valid `vss_XXXXXXXX` serial is known the export asks for one (or for a file
+to save into) instead of writing anywhere.
 The export **merges** into `static_transforms.yaml`: only the key being exported
 (`livox_to_context` or `livox_to_zoom`) is replaced, so calibrating the zoom camera
 leaves the context transform — and anything else in the file — untouched.
@@ -197,9 +202,15 @@ Records a short `.mcap` bag from a running sensor-suite container and copies it 
 SSH access unless you pass `--local`.
 
 ```bash
-./capture_bag.sh dockware@beyonce --serial vss_016 --duration 10
-./capture_bag.sh --local --serial vss_016          # 3s by default
+./capture_bag.sh --local --name vss_00000045                         # 3s by default
+./capture_bag.sh dockware@beyonce --name vss_00000045 --duration 10
 ```
+
+`--name` is the device serial the bag is saved as, written out in full as `vss_` plus
+8 digits (`--name vss_00000045` → `bags/vss_00000045_calib_<timestamp>`), so the GUI picks up the serial from the
+bag name and exports into `devices/vss_00000045/`. `--serial` picks the container to
+record from and defaults to `calib` (the `vss_calib` calibration container); without
+`--name` the bag is named after the container.
 
 ## 5. Troubleshooting
 

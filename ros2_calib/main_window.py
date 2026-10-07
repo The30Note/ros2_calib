@@ -126,6 +126,7 @@ class MainWindow(QMainWindow):
         self.selected_topics_data: Dict = {}
 
         self.calibration_completed.connect(self._on_calibration_result)
+        self._serial_autofilled = False   # serial field filled from a bag name, not typed
 
         # ── Layout ─────────────────────────────────────────────────────
         central = QWidget()
@@ -236,12 +237,22 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _normalize_serial(serial: str) -> str:
-        """Accept 'vss_00000041', '00000041' or '41' -> 'vss_00000041'."""
+        """Accept 'vss_00000041', 'vss_41', '00000041' or '41' -> 'vss_00000041'.
+
+        Anything else (e.g. 'vss_calib', the placeholder serial of the calibration
+        container) is passed through and rejected by _is_valid_serial.
+        """
         text = serial.strip()
-        return f"vss_{int(text):08d}" if text.isdigit() else text
+        digits = text[4:] if text.startswith("vss_") else text
+        return f"vss_{int(digits):08d}" if digits.isdigit() else text
+
+    @staticmethod
+    def _is_valid_serial(serial: str) -> bool:
+        return bool(re.fullmatch(r"vss_\d{8}", serial))
 
     def _on_serial_edited(self):
         """Re-point the device paths at the typed serial."""
+        self._serial_autofilled = False
         text = self.serial_input.text().strip()
         normalized = self._normalize_serial(text) if text else ""
         if normalized != text:
@@ -252,7 +263,7 @@ class MainWindow(QMainWindow):
 
     def _update_serial_field_state(self):
         """Highlight the field when a bag is loaded but no serial is known."""
-        needs_input = bool(self.bag_file) and not self._device_serial
+        needs_input = bool(self.bag_file) and not self._is_valid_serial(self._device_serial)
         self.serial_input.setStyleSheet(
             "QLineEdit { background: #5a1010; color: #ff9999; }" if needs_input else ""
         )
@@ -777,11 +788,17 @@ class MainWindow(QMainWindow):
             self.bag_path_label.setStyleSheet("color: #ccc; padding: 0 8px;")
             self.topics = get_topic_info(file_path, ROS_DISTRO)
             self.topic_types = {t: m for t, m, _ in self.topics}
-            # A serial in the new bag name replaces whatever the field held; a bag
-            # without one leaves a manually typed serial in place.
+            # A serial in the new bag name replaces whatever the field held. A bag
+            # without one keeps a serial the user typed, but drops one that was
+            # auto-filled from the previous bag: keeping it sent the export into
+            # the previous device's folder.
             from_name = self._serial_from_bag_name()
             if from_name:
                 self.serial_input.setText(from_name)
+                self._serial_autofilled = True
+            elif self._serial_autofilled:
+                self.serial_input.clear()
+                self._serial_autofilled = False
             self._update_serial_field_state()
             self.update_topic_widgets()
             # The serial is known as soon as the bag path is: load this device's
@@ -1434,13 +1451,14 @@ class MainWindow(QMainWindow):
         path = self._static_transforms_path
         key = self._transform_key
 
-        if not self._device_serial:
+        if not self._is_valid_serial(self._device_serial):
             self.serial_input.setFocus()
             QMessageBox.information(
                 self, "Device serial not set",
-                "No serial in the bag name and none typed in the Serial field, so the "
-                "device folder cannot be derived.\n\nType the serial up top and export "
-                "again, or pick a file to save into now.",
+                "No valid serial (vss_XXXXXXXX) in the bag name or the Serial field "
+                f"(it holds '{self._device_serial}'), so the device folder cannot be "
+                "derived.\n\nType the serial up top and export again, or pick a file "
+                "to save into now.",
             )
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save Extrinsics (merges into the chosen file)",
@@ -1467,16 +1485,39 @@ class MainWindow(QMainWindow):
 
         try:
             self._write_calib_yaml(path)
+            written = self._read_back_transform(path, key)
         except Exception as e:
-            QMessageBox.warning(self, "Export failed", str(e))
+            QMessageBox.warning(self, "Export failed", f"{os.path.abspath(path)}\n\n{e}")
+            return
+
+        # Report only what is actually on disk, not what we meant to write.
+        if not np.allclose(written, self.current_transform, atol=1e-5):
+            QMessageBox.warning(
+                self, "Export failed",
+                f"{key} in {os.path.abspath(path)} does not match the current "
+                "calibration after writing it.",
+            )
             return
 
         verb = "Overwrote" if updated else "Added"
         QMessageBox.information(
             self, "Extrinsics exported",
-            f"{verb} {key} in:\n{self._display_path(path)}\n\n"
+            f"{verb} {key} in:\n{os.path.abspath(path)}\n\n"
             "Every other transform in the file was left untouched.",
         )
+
+    @staticmethod
+    def _read_back_transform(path: str, key: str) -> np.ndarray:
+        """Parse `key` back out of an exported static_transforms.yaml."""
+        with open(path) as f:
+            entry = (yaml.safe_load(f) or {}).get(key)
+        if not entry:
+            raise ValueError(f"{key} is missing from the file after writing it.")
+        t, r = entry["translation"], entry["rotation"]
+        T = np.eye(4)
+        T[:3, :3] = Rotation.from_quat([r["x"], r["y"], r["z"], r["w"]]).as_matrix()
+        T[:3, 3] = [t["x"], t["y"], t["z"]]
+        return T
 
     # ================================================================== #
     #  TF tree                                                            #
@@ -1624,6 +1665,7 @@ class MainWindow(QMainWindow):
         )
         self.calib_widget.calibration_completed.connect(self.calibration_completed)
         self.calib_widget.extrinsics_updated.connect(self._on_calibration_result_update)
+        self.calib_widget.export_requested.connect(self._export_extrinsics)
 
         # Embed the ZoomableView in the left panel
         self.calib_widget.view.setParent(self.view_container)
