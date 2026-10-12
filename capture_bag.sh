@@ -151,8 +151,12 @@ run_host "docker exec '${CONTAINER}' bash -c '
     ROS_DISTRO=\$(ls /opt/ros/ | head -1)
     source /opt/ros/\${ROS_DISTRO}/setup.bash 2>/dev/null || true
     source /ros_ws/install/setup.bash 2>/dev/null || true
+    # Overlay providing rmw_zenoh_cpp / rmw_stats_shim on zenoh containers
+    for ws in /home/*/external_deps_ws/install; do
+        [ -f \"\$ws/setup.bash\" ] && source \"\$ws/setup.bash\"
+    done
 
-    if ! ros2 bag record --storage mcap --help > /dev/null 2>&1; then
+    if ! ros2 pkg prefix rosbag2_storage_mcap > /dev/null 2>&1; then
         echo \"Installing MCAP storage plugin...\"
         apt-get install -y ros-\${ROS_DISTRO}-rosbag2-storage-mcap
     fi
